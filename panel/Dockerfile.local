@@ -1,0 +1,16 @@
+# 离线/本地快速打包面板镜像（使用宿主机 Vite + tsc 构建产物与本地已缓存 node:22-alpine）
+# 用法（在仓库外临时目录组装纯 JS 运行时上下文后执行）：
+#   DOCKER_BUILDKIT=0 docker build -f panel/Dockerfile.local -t woc-panel:local <stage_dir>
+FROM node:22-alpine
+WORKDIR /app
+ENV NODE_ENV=production
+COPY package.json ./
+COPY node_modules ./node_modules
+COPY dist ./dist
+COPY web-dist ./web-dist
+ARG WOC_VERSION=dev
+ENV WOC_VERSION=${WOC_VERSION} \
+    STATIC_DIR=/app/web-dist \
+    PORT=8080
+EXPOSE 8080
+CMD ["node", "dist/index.js"]

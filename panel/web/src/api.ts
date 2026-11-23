@@ -46,6 +46,52 @@ export const APP_PROFILES: Record<AppType, AppProfile> = {
   custom: { label: '自定义应用', needsInstall: true, enterHint: '', updateLabel: '更新' },
 };
 export const appProfile = (t?: AppType): AppProfile => APP_PROFILES[t ?? 'wechat'] ?? APP_PROFILES.wechat;
+export interface InstalledAddon {
+  id: string;
+  enabled?: boolean;
+  options?: Record<string, unknown>;
+}
+export interface AddonOptionProperty {
+  type: 'string' | 'boolean';
+  title: string;
+  description?: string;
+  default?: string | boolean;
+  placeholder?: string;
+}
+export interface AddonManifest {
+  apiVersion: 'woc.addon/v1';
+  id: string;
+  name: string;
+  description: string;
+  version: string;
+  image: string;
+  supportedApps?: string[];
+  options?: {
+    type: 'object';
+    properties: Record<string, AddonOptionProperty>;
+    required?: string[];
+  };
+}
+export interface AddonRuntimeStatus {
+  id: string;
+  name: string;
+  runtime: RuntimeState;
+  containerName: string;
+  state?: string;
+  lastRun?: string;
+  lastError?: string;
+  lastErrorDetail?: string;
+  lastSkipped?: string;
+  lastSkippedAt?: string;
+  updatedAt?: string;
+  accounts?: string[];
+}
+export interface McpConnectionInfo {
+  enabled: boolean;
+  path: string;
+  mcpToken: string;
+}
+
 export interface PanelInstance {
   id: string;
   name: string;
@@ -55,6 +101,7 @@ export interface PanelInstance {
   createdBy: string;
   memSoftLimitMB?: number;
   memHardLimitMB?: number;
+  addons?: InstalledAddon[];
 }
 export interface MemLimits {
   soft: number | null;
@@ -69,6 +116,7 @@ export interface InstanceWithStatus extends PanelInstance {
   runtime: RuntimeState;
   wechat: WechatStatus;
   imageVersion?: string | null; // 实例镜像版本（CI 发布版如 "1.4.0"；自构建为镜像短 id；容器缺失为 null）
+  addonStatuses?: AddonRuntimeStatus[];
   provision?: ProvisionInfo; // 容器还没建成时才有（#129）
 }
 
@@ -322,10 +370,34 @@ export const api = {
 
   // 微信实例
   listInstances: () => req<{ instances: InstanceWithStatus[] }>('/api/instances'),
-  createInstance: (name: string, allowedUserIds: string[] = [], reuseVolume?: string, appType: AppType = 'wechat') =>
+  createInstance: (
+    name: string,
+    allowedUserIds: string[] = [],
+    reuseVolume?: string,
+    appType: AppType = 'wechat',
+    addons?: InstalledAddon[],
+  ) =>
     req<{ instance: PanelInstance; started?: boolean }>('/api/admin/instances', {
       method: 'POST',
-      body: JSON.stringify({ name, allowedUserIds, reuseVolume: reuseVolume || undefined, appType }),
+      body: JSON.stringify({
+        name,
+        allowedUserIds,
+        reuseVolume: reuseVolume || undefined,
+        appType,
+        ...(addons && addons.length ? { addons } : {}),
+      }),
+    }),
+  listAddons: () => req<{ addons: AddonManifest[] }>('/api/admin/addons'),
+  setInstanceAddons: (id: string, addons: InstalledAddon[]) =>
+    req<{ instance: PanelInstance; addonStatuses: AddonRuntimeStatus[] }>(`/api/admin/instances/${id}/addons`, {
+      method: 'PUT',
+      body: JSON.stringify({ addons }),
+    }),
+  getInstanceMcpInfo: (id: string) =>
+    req<McpConnectionInfo>(`/api/admin/instances/${id}/addons/mcp`),
+  rotateInstanceMcpToken: (id: string) =>
+    req<{ ok: boolean; path: string; mcpToken: string }>(`/api/admin/instances/${id}/addons/mcp/rotate`, {
+      method: 'POST',
     }),
   regenMachineId: (id: string) =>
     req(`/api/admin/instances/${id}/regen-machine-id`, { method: 'POST' }),

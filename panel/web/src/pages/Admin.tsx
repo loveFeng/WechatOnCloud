@@ -1,7 +1,21 @@
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import Cropper from 'react-easy-crop';
-import { api, APP_LABELS, appProfile, fmtUploadSize, provisionProgressText, type PanelUser, type InstanceWithStatus, type VolEntry, type AppType, type VersionInfo } from '../api';
+import {
+  api,
+  APP_LABELS,
+  appProfile,
+  fmtUploadSize,
+  provisionProgressText,
+  type PanelUser,
+  type InstanceWithStatus,
+  type VolEntry,
+  type AppType,
+  type VersionInfo,
+  type AddonManifest,
+  type InstalledAddon,
+  type McpConnectionInfo,
+} from '../api';
 import { InstanceIcon, ICON_CHOICES } from '../AppIcon';
 import { useUI, PasswordInput } from '../ui';
 import { useAuth } from '../auth';
@@ -286,6 +300,7 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
   const [securityInst, setSecurityInst] = useState<InstanceWithStatus | null>(null); // 安全（内存阈值）弹窗
   const [volumeInst, setVolumeInst] = useState<InstanceWithStatus | null>(null); // 数据卷管理弹窗
   const [iconInst, setIconInst] = useState<InstanceWithStatus | null>(null); // 图标编辑弹窗
+  const [addonsInst, setAddonsInst] = useState<InstanceWithStatus | null>(null); // 附加功能（插件）弹窗
   const [acting, setActing] = useState<Record<string, string>>({}); // 实例 id → 进行中的动作文案（启动中/升级中…）
   // 管理页信息架构：实例 / 用户 / 系统 三个 Tab（此前 7 个区块一条长滚动，找东西全靠翻）。
   // 记住上次停留的 Tab（sessionStorage），升级轮询等跨 Tab 状态不受影响——Tab 只控制渲染。
@@ -649,6 +664,7 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
                     onSecurity={() => setSecurityInst(inst)}
                     onVolume={() => setVolumeInst(inst)}
                     onIcon={() => setIconInst(inst)}
+                    onAddons={() => setAddonsInst(inst)}
                   />
                 ))}
               </ul>
@@ -922,6 +938,17 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
           onClose={() => setIconInst(null)}
           onDone={() => {
             toast('已更新图标', 'ok');
+            load();
+          }}
+        />
+      )}
+      {addonsInst && (
+        <InstanceAddonsModal
+          inst={addonsInst}
+          onClose={() => setAddonsInst(null)}
+          onDone={() => {
+            setAddonsInst(null);
+            toast('附加功能配置已同步', 'ok');
             load();
           }}
         />
@@ -1307,6 +1334,7 @@ function InstanceAdminCard({
   onSecurity,
   onVolume,
   onIcon,
+  onAddons,
 }: {
   inst: InstanceWithStatus;
   no: number;
@@ -1325,6 +1353,7 @@ function InstanceAdminCard({
   onSecurity: () => void;
   onVolume: () => void;
   onIcon: () => void;
+  onAddons: () => void;
 }) {
   const wx = inst.wechat;
   const busy = BUSY_PHASES.includes(wx.phase);
@@ -1371,6 +1400,7 @@ function InstanceAdminCard({
     ...(!offline ? [{ label: '重启', onClick: onRestart }, { label: '停止', onClick: onStop }] : []),
     { label: '日志', title: '实例日志（含重启原因与上一容器日志快照）', onClick: () => window.open(api.instanceLogsUrl(inst.id), '_blank') },
     { group: '设置' },
+    { label: '附加功能（插件）', title: '启用公众号素材归档、配置定时抓取与查看 MCP 接入凭据', onClick: onAddons },
     { label: '重命名', onClick: onRename },
     { label: '分配账户', onClick: onAssign },
     { label: '图标', title: '内置图标 / 上传图片裁剪', onClick: onIcon },
@@ -1400,6 +1430,41 @@ function InstanceAdminCard({
                 可升级
               </span>
             )}
+            {(inst.addonStatuses || []).map((ad) => {
+              if (ad.lastError === 'LOGIN_REQUIRED') {
+                return (
+                  <span key={ad.id} className="tag tag-off" title={ad.lastErrorDetail || '微信登录已失效，请进入实例扫码登录'}>
+                    {ad.name} · 需重新扫码
+                  </span>
+                );
+              }
+              if (ad.lastError === 'STALE_SESSION_KEY') {
+                return (
+                  <span key={ad.id} className="tag tag-warn" title={ad.lastErrorDetail || '尚未获取到新鲜会话密钥，请在微信打开任意公众号文章或等待下次自动刷新'}>
+                    {ad.name} · 密钥待刷新
+                  </span>
+                );
+              }
+              if (ad.lastError) {
+                return (
+                  <span key={ad.id} className="tag tag-off" title={ad.lastErrorDetail || ad.lastError}>
+                    {ad.name} · 异常
+                  </span>
+                );
+              }
+              if (ad.runtime === 'running') {
+                return (
+                  <span key={ad.id} className={ad.state === 'running' ? 'tag tag-busy' : 'tag tag-on'} title={ad.lastRun ? `上次运行：${ad.lastRun}` : ad.containerName}>
+                    {ad.state === 'running' ? `${ad.name} · 抓取中` : ad.name}
+                  </span>
+                );
+              }
+              return (
+                <span key={ad.id} className="tag tag-muted" title={ad.containerName}>
+                  {ad.name} · 未启动
+                </span>
+              );
+            })}
             {!createFailed && <span>可访问 {userCount} 人</span>}
           </div>
           <span className={'entry-note' + (createFailed && !acting ? ' is-fail' : '')}>{sub}</span>
@@ -1954,10 +2019,127 @@ const APP_OPTIONS: { type: AppType; desc: string; ready: boolean }[] = [
   { type: 'custom', desc: '即将支持', ready: false },
 ];
 
+// 根据 manifest v1 渲染「附加功能（插件）」勾选与配置表单（新建实例与编辑实例共用）
+function AddonPickerSection({
+  catalog,
+  appType,
+  value,
+  onChange,
+}: {
+  catalog: AddonManifest[];
+  appType: AppType;
+  value: Record<string, Record<string, unknown>>;
+  onChange: (next: Record<string, Record<string, unknown>>) => void;
+}) {
+  const compatible = catalog.filter((m) => !m.supportedApps?.length || m.supportedApps.includes(appType));
+  if (compatible.length === 0) return null;
+
+  const toggleAddon = (m: AddonManifest) => {
+    const next = { ...value };
+    if (next[m.id]) {
+      delete next[m.id];
+    } else {
+      const defaults: Record<string, unknown> = {};
+      for (const [k, prop] of Object.entries(m.options?.properties || {})) {
+        if (prop.default !== undefined) defaults[k] = prop.default;
+      }
+      next[m.id] = defaults;
+    }
+    onChange(next);
+  };
+
+  const setOpt = (addonId: string, key: string, v: unknown) => {
+    onChange({
+      ...value,
+      [addonId]: { ...(value[addonId] || {}), [key]: v },
+    });
+  };
+
+  return (
+    <div style={{ marginTop: 12 }}>
+      <div className="field-label">附加功能（可选）</div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+        {compatible.map((m) => {
+          const checked = !!value[m.id];
+          const opts = value[m.id] || {};
+          const props = m.options?.properties || {};
+          return (
+            <div
+              key={m.id}
+              style={{
+                border: '1px solid var(--line, rgba(128,128,128,0.22))',
+                borderRadius: 10,
+                padding: '10px 12px',
+              }}
+            >
+              <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  onChange={() => toggleAddon(m)}
+                  style={{ marginTop: 3 }}
+                />
+                <span style={{ flex: 1 }}>
+                  <span style={{ fontWeight: 600 }}>{m.name}</span>{' '}
+                  <span className="muted small">v{m.version}</span>
+                  <div className="muted small" style={{ marginTop: 2 }}>
+                    {m.description}
+                  </div>
+                </span>
+              </label>
+              {checked && Object.keys(props).length > 0 && (
+                <div style={{ marginTop: 10, paddingLeft: 22, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  {Object.entries(props).map(([key, prop]) => (
+                    <div key={key}>
+                      {prop.type === 'boolean' ? (
+                        <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
+                          <input
+                            type="checkbox"
+                            checked={Boolean(opts[key] ?? prop.default)}
+                            onChange={(e) => setOpt(m.id, key, e.target.checked)}
+                          />
+                          <span>{prop.title}</span>
+                        </label>
+                      ) : (
+                        <>
+                          <div className="muted small" style={{ marginBottom: 4 }}>
+                            {prop.title}
+                          </div>
+                          <input
+                            className="input"
+                            placeholder={prop.placeholder || (typeof prop.default === 'string' ? prop.default : '')}
+                            value={String(opts[key] ?? prop.default ?? '')}
+                            onChange={(e) => setOpt(m.id, key, e.target.value)}
+                          />
+                        </>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function toInstalledAddons(map: Record<string, Record<string, unknown>>, catalog: AddonManifest[], appType: AppType): InstalledAddon[] {
+  const allowed = new Set(
+    catalog.filter((m) => !m.supportedApps?.length || m.supportedApps.includes(appType)).map((m) => m.id),
+  );
+  return Object.entries(map)
+    .filter(([id]) => allowed.has(id))
+    .map(([id, options]) => ({ id, enabled: true, options }));
+}
+
 function CreateInstance({ subs, onClose, onDone }: { subs: PanelUser[]; onClose: () => void; onDone: () => void }) {
   const [name, setName] = useState('');
   const [appType, setAppType] = useState<AppType>('wechat');
   const [sel, setSel] = useState<Set<string>>(new Set());
+  const [catalog, setCatalog] = useState<AddonManifest[]>([]);
+  const [addonMap, setAddonMap] = useState<Record<string, Record<string, unknown>>>({});
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
   const { toast } = useUI();
@@ -1973,6 +2155,12 @@ function CreateInstance({ subs, onClose, onDone }: { subs: PanelUser[]; onClose:
       .catch(() => {
         /* 读取失败时不阻塞创建：列表为空即可，照常新建空卷 */
       });
+    api
+      .listAddons()
+      .then(({ addons }) => alive && setCatalog(addons))
+      .catch(() => {
+        /* ignore */
+      });
     return () => {
       alive = false;
     };
@@ -1983,8 +2171,9 @@ function CreateInstance({ subs, onClose, onDone }: { subs: PanelUser[]; onClose:
     setErr('');
     setBusy(true);
     try {
+      const addons = toInstalledAddons(addonMap, catalog, appType);
       // 服务端登记后立即返回、后台建容器（可能要先拉镜像）：关掉弹窗，进度和结果看实例列表（#129）
-      await api.createInstance(name.trim(), [...sel], reuse || undefined, appType);
+      await api.createInstance(name.trim(), [...sel], reuse || undefined, appType, addons);
       toast('实例已登记，正在后台创建，进度见实例列表', 'info');
       onDone();
     } catch (e: any) {
@@ -2031,6 +2220,7 @@ function CreateInstance({ subs, onClose, onDone }: { subs: PanelUser[]; onClose:
           onToggle={(id) => setSel((s) => toggleSet(s, id))}
           empty="暂无子账号"
         />
+        <AddonPickerSection catalog={catalog} appType={appType} value={addonMap} onChange={setAddonMap} />
         {orphans.length > 0 && (
           <>
             <label className="field-label" htmlFor="ci-volume" style={{ marginTop: 12 }}>
@@ -2061,6 +2251,166 @@ function CreateInstance({ subs, onClose, onDone }: { subs: PanelUser[]; onClose:
           </button>
           <button className="btn btn-primary" disabled={busy}>
             创建
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function InstanceAddonsModal({
+  inst,
+  onClose,
+  onDone,
+}: {
+  inst: InstanceWithStatus;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const appType: AppType = inst.appType || 'wechat';
+  const [catalog, setCatalog] = useState<AddonManifest[]>([]);
+  const [addonMap, setAddonMap] = useState<Record<string, Record<string, unknown>>>(() => {
+    const init: Record<string, Record<string, unknown>> = {};
+    for (const a of inst.addons || []) {
+      if (a && a.enabled !== false) {
+        const opts = { ...(a.options || {}) };
+        if (Array.isArray(opts.accounts)) opts.accounts = opts.accounts.join(', ');
+        init[a.id] = opts;
+      }
+    }
+    return init;
+  });
+  const [mcp, setMcp] = useState<McpConnectionInfo | null>(null);
+  const [showToken, setShowToken] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const { toast } = useUI();
+
+  useEffect(() => {
+    let alive = true;
+    api
+      .listAddons()
+      .then(({ addons }) => alive && setCatalog(addons))
+      .catch((e: any) => alive && setErr(e?.message || '读取插件列表失败'));
+    api
+      .getInstanceMcpInfo(inst.id)
+      .then((info) => alive && setMcp(info))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [inst.id]);
+
+  const save = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErr('');
+    setBusy(true);
+    try {
+      const addons = toInstalledAddons(addonMap, catalog, appType);
+      await api.setInstanceAddons(inst.id, addons);
+      onDone();
+    } catch (e: any) {
+      setErr(e?.message || '保存附加功能失败');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const rotateToken = async () => {
+    setBusy(true);
+    try {
+      const res = await api.rotateInstanceMcpToken(inst.id);
+      setMcp((prev) => ({ enabled: prev?.enabled ?? true, path: res.path, mcpToken: res.mcpToken }));
+      toast('MCP 与插件凭据已轮换', 'ok');
+    } catch (e: any) {
+      setErr(e?.message || '轮换凭据失败');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const copyMcpJson = async () => {
+    if (!mcp) return;
+    const url = `${window.location.origin}${mcp.path}`;
+    const snippet = JSON.stringify(
+      {
+        mcpServers: {
+          [`wxdown-${inst.id}`]: {
+            type: 'http',
+            url,
+            headers: { Authorization: `Bearer ${mcp.mcpToken}` },
+          },
+        },
+      },
+      null,
+      2,
+    );
+    try {
+      await navigator.clipboard.writeText(snippet);
+      toast('已复制 MCP 客户端配置 JSON', 'ok');
+    } catch {
+      toast('浏览器限制剪贴板写入，请展开凭据手动复制', 'info');
+      setShowToken(true);
+    }
+  };
+
+  return (
+    <div className="modal-mask" onClick={onClose}>
+      <form className="card modal" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()} onSubmit={save}>
+        <h2>附加功能 · 「{inst.name}」</h2>
+        <AddonPickerSection catalog={catalog} appType={appType} value={addonMap} onChange={setAddonMap} />
+        {(inst.addonStatuses || []).length > 0 && (
+          <div style={{ marginTop: 12 }}>
+            <div className="field-label">当前状态</div>
+            {(inst.addonStatuses || []).map((st) => (
+              <div key={st.id} className="muted small" style={{ lineHeight: 1.7 }}>
+                <div>
+                  容器：<code>{st.containerName}</code>（{st.runtime === 'running' ? '运行中' : '未运行'}
+                  {st.state ? ` · 任务态 ${st.state}` : ''}）
+                </div>
+                {st.lastRun && <div>上次完成：{st.lastRun}</div>}
+                {st.lastSkipped && <div>最近跳过：{st.lastSkipped}（{st.lastSkippedAt || ''}）</div>}
+                {st.lastError && (
+                  <div style={{ color: 'var(--danger, #e5484d)' }}>
+                    最近错误：{st.lastError}
+                    {st.lastErrorDetail ? ` — ${st.lastErrorDetail}` : ''}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+        {mcp && addonMap['wxdown-archiver'] && (
+          <div style={{ marginTop: 12 }}>
+            <div className="field-label">AI MCP 接入信息</div>
+            <div className="muted small" style={{ wordBreak: 'break-all', lineHeight: 1.7 }}>
+              <div>
+                端点：<code>{`${window.location.origin}${mcp.path}`}</code>
+              </div>
+              <div>
+                Token：<code>{showToken ? mcp.mcpToken : `${mcp.mcpToken.slice(0, 6)}••••••••${mcp.mcpToken.slice(-4)}`}</code>
+              </div>
+            </div>
+            <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
+              <button type="button" className="btn" onClick={() => setShowToken((v) => !v)}>
+                {showToken ? '隐藏 Token' : '显示 Token'}
+              </button>
+              <button type="button" className="btn" onClick={copyMcpJson}>
+                复制 MCP 配置
+              </button>
+              <button type="button" className="btn" disabled={busy} onClick={rotateToken}>
+                轮换凭据
+              </button>
+            </div>
+          </div>
+        )}
+        {err && <div className="error" style={{ marginTop: 10 }}>{err}</div>}
+        <div className="modal-actions">
+          <button type="button" className="btn" onClick={onClose}>
+            取消
+          </button>
+          <button className="btn btn-primary" disabled={busy}>
+            保存并同步容器
           </button>
         </div>
       </form>
