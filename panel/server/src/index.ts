@@ -2080,8 +2080,11 @@ proxy.on('error', (_err, req, res) => {
 });
 
 // /desktop/:id/rest → rest（剥掉前缀与实例段）。返回 null 表示 url 非法。
+// id 字符集放宽到 [A-Za-z0-9_-]：标准实例 id 是 10 位 hex，但本地手工/迁移进来的实例
+// （如 local00001）不是 hex，旧正则会把它们判为非法 URL 直接 403，导致桌面 iframe 黑屏。
+// 真正的鉴权仍由 userCanAccess + findInstance 兜底，这里只负责拆分 URL。
 function parseDesktopUrl(rawUrl: string): { id: string; rest: string } | null {
-  const m = rawUrl.match(/^\/desktop\/([0-9a-f]{6,})(\/.*|\?.*|)?$/);
+  const m = rawUrl.match(/^\/desktop\/([A-Za-z0-9_-]{1,64})(\/.*|\?.*|)?$/);
   if (!m) return null;
   const id = m[1];
   let rest = m[2] || '/';
