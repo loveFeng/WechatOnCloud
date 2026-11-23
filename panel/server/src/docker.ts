@@ -2754,7 +2754,7 @@ export async function refreshArticleViaFileHelper(
         'done',
         'for bw in $(xdotool search --onlyvisible --class "WeChatAppEx" 2>/dev/null || true); do xdotool windowclose "$bw" 2>/dev/null || true; done',
         'sleep 0.4',
-        'pkill -TERM -f "RadiumWMPF/runtime/WeChatAppEx" 2>/dev/null || true',
+        'pkill -TERM -f "[R]adiumWMPF/runtime/WeChatAppEx" 2>/dev/null || true',
         'echo "REFRESHED=$REFRESHED"',
       ].join('\n');
 
