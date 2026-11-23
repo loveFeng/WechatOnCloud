@@ -2464,17 +2464,21 @@ const HEALTH_FAIL_LIMIT = Math.max(0, Number(process.env.WOC_WATCHDOG_HEALTH_FAI
 const WATCHDOG_ENABLED = WATCHDOG_INTERVAL_SEC > 0 && (DEFAULT_SOFT_MB > 0 || DEFAULT_HARD_MB > 0);
 
 // 单实例生效阈值：per-instance 覆盖优先；为 undefined 则用 env 默认。
+// 注意：启用了「公众号素材归档」后台插件且未手动指定 memSoftLimitMB 的实例，关闭无人值守 soft 重启
+//（保留 hard OOM 安全阀），避免自动打开内置浏览器或无人看守时触发容器重建导致微信退回手机确认登录页。
 function effectiveLimits(inst: Instance): { soft: number; hard: number } {
+  const hasUnattendedArchiver = !!inst.addons?.['wxdown-archiver']?.enabled;
   return {
-    soft: inst.memSoftLimitMB ?? DEFAULT_SOFT_MB,
+    soft: inst.memSoftLimitMB ?? (hasUnattendedArchiver ? 0 : DEFAULT_SOFT_MB),
     hard: inst.memHardLimitMB ?? DEFAULT_HARD_MB,
   };
 }
 
-// “当前有人在远程会话”同时看两类信号：VNC WebSocket 表示仍在观看，控制权心跳表示最近
-// 有键鼠操作。Chrome 后台标签页会停止交互心跳，但只要桌面连接仍在，就不能做 soft 重启。
+// “当前有人在远程会话”同时看三类信号：VNC WebSocket 表示仍在观看，控制权心跳表示最近
+// 有键鼠操作，isAutoRefreshing 表示插件正在执行自动刷新。只要任一活跃，就不能做 soft 重启。
 function hasActiveSession(id: string): boolean {
   if (activeVncViewerCount(id) > 0) return true;
+  if (isAutoRefreshing(id)) return true;
   const h = controlHolders.get(id);
   return !!h && Date.now() - h.at <= CONTROL_TTL;
 }
