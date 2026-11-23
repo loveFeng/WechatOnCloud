@@ -2467,7 +2467,8 @@ const WATCHDOG_ENABLED = WATCHDOG_INTERVAL_SEC > 0 && (DEFAULT_SOFT_MB > 0 || DE
 // 注意：启用了「公众号素材归档」后台插件且未手动指定 memSoftLimitMB 的实例，关闭无人值守 soft 重启
 //（保留 hard OOM 安全阀），避免自动打开内置浏览器或无人看守时触发容器重建导致微信退回手机确认登录页。
 function effectiveLimits(inst: Instance): { soft: number; hard: number } {
-  const hasUnattendedArchiver = !!inst.addons?.['wxdown-archiver']?.enabled;
+  const hasUnattendedArchiver =
+    Array.isArray(inst.addons) && inst.addons.some((a) => a?.id === 'wxdown-archiver' && a.enabled !== false);
   return {
     soft: inst.memSoftLimitMB ?? (hasUnattendedArchiver ? 0 : DEFAULT_SOFT_MB),
     hard: inst.memHardLimitMB ?? DEFAULT_HARD_MB,
