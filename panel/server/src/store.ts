@@ -40,6 +40,12 @@ export function instanceAppType(i: Instance): AppType {
   return i.appType && APP_TYPES.includes(i.appType) ? i.appType : 'wechat';
 }
 
+export interface InstalledAddon {
+  id: string;
+  enabled?: boolean; // 缺省视为 true
+  options?: Record<string, unknown>;
+}
+
 export interface Instance {
   id: string; // 短 id，用于容器/卷命名
   name: string; // 显示名
@@ -58,6 +64,10 @@ export interface Instance {
   // hard：内存超此值时，无论是否有人在会话都重启（防止 OOM 拖垮宿主）。
   memSoftLimitMB?: number;
   memHardLimitMB?: number;
+  // 已启用的附加功能（sidecar 插件）及其实例绑定的鉴权凭据（凭据绝不经 publicInstance 下发）。
+  addons?: InstalledAddon[];
+  addonToken?: string;
+  mcpToken?: string;
   // 容器还没建成功时的原因（#129）：创建/重试创建失败时写入，建成后清除。有值时面板启动不再自动重试
   // （重试多半又要拉镜像，会把面板开始监听拖上好几分钟），卡片显示「创建失败」等管理员点重试。
   // 创建开始时先写一个「未完成」占位：面板在创建途中重启时，重启后能看出这次创建没完成，而不是一个无解释的「未创建」。
@@ -111,6 +121,11 @@ export function initStore() {
   }
   // 迁移：补齐新增字段，兼容旧账号文件
   if (!Array.isArray(data.instances)) data.instances = [];
+  for (const inst of data.instances) {
+    if (inst.addons !== undefined && !Array.isArray(inst.addons)) inst.addons = [];
+    if (!inst.addonToken) inst.addonToken = randomBytes(24).toString('hex');
+    if (!inst.mcpToken) inst.mcpToken = randomBytes(24).toString('hex');
+  }
   for (const u of data.users) {
     if (!Array.isArray(u.allowedInstances)) u.allowedInstances = [];
   }
@@ -264,6 +279,7 @@ export function publicInstance(i: Instance) {
     createdBy: i.createdBy,
     memSoftLimitMB: i.memSoftLimitMB,
     memHardLimitMB: i.memHardLimitMB,
+    addons: (i.addons || []).filter((a) => a && a.enabled !== false),
   };
 }
 
@@ -335,6 +351,7 @@ export function createInstance(
   allowedUserIds: string[] = [],
   reuseVolumeName?: string,
   appType: AppType = 'wechat',
+  addons?: InstalledAddon[],
 ) {
   const type: AppType = APP_TYPES.includes(appType) ? appType : 'wechat';
   let id = randomBytes(5).toString('hex'); // 10 hex chars
@@ -346,6 +363,7 @@ export function createInstance(
     }
     volumeName = reuseVolumeName; // 始终指向旧卷（即便 id 是新生成的）
   }
+  const cleanAddons = Array.isArray(addons) ? addons.filter((a) => a && a.enabled !== false) : [];
   const inst: Instance = {
     id,
     name: name.trim() || autoInstanceName(type),
@@ -358,6 +376,9 @@ export function createInstance(
     kasmPassword: randomBytes(24).toString('hex'),
     createdAt: new Date().toISOString(),
     createdBy,
+    addons: cleanAddons.length ? cleanAddons : undefined,
+    addonToken: randomBytes(24).toString('hex'),
+    mcpToken: randomBytes(24).toString('hex'),
   };
   data.instances.push(inst);
   // 把访问权限写到选中的账户上
@@ -367,6 +388,26 @@ export function createInstance(
       u.allowedInstances.push(id);
     }
   }
+  persist();
+  return inst;
+}
+
+export function setInstanceAddons(id: string, addons: InstalledAddon[]) {
+  const inst = findInstance(id);
+  if (!inst) throw new Error('实例不存在');
+  const clean = Array.isArray(addons) ? addons.filter((a) => a && a.enabled !== false) : [];
+  inst.addons = clean.length ? clean : undefined;
+  if (!inst.addonToken) inst.addonToken = randomBytes(24).toString('hex');
+  if (!inst.mcpToken) inst.mcpToken = randomBytes(24).toString('hex');
+  persist();
+  return inst;
+}
+
+export function rotateInstanceAddonTokens(id: string) {
+  const inst = findInstance(id);
+  if (!inst) throw new Error('实例不存在');
+  inst.addonToken = randomBytes(24).toString('hex');
+  inst.mcpToken = randomBytes(24).toString('hex');
   persist();
   return inst;
 }
@@ -452,7 +493,13 @@ export function registerExistingInstance(opts: {
   createdBy: string;
 }) {
   const id = randomBytes(5).toString('hex');
-  const inst: Instance = { id, createdAt: new Date().toISOString(), ...opts };
+  const inst: Instance = {
+    id,
+    createdAt: new Date().toISOString(),
+    addonToken: randomBytes(24).toString('hex'),
+    mcpToken: randomBytes(24).toString('hex'),
+    ...opts,
+  };
   data.instances.push(inst);
   persist();
   return inst;

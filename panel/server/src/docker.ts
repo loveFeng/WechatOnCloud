@@ -69,9 +69,9 @@ export async function resolveInstanceImage(): Promise<void> {
   );
   WECHAT_IMAGE = fallback;
 }
-const PUID = process.env.PUID || '1000';
-const PGID = process.env.PGID || '1000';
-const TZ = process.env.TZ || 'Asia/Shanghai';
+export const PUID = process.env.PUID || '1000';
+export const PGID = process.env.PGID || '1000';
+export const TZ = process.env.TZ || 'Asia/Shanghai';
 const SHM_SIZE = 1024 * 1024 * 1024; // 1gb
 
 // 默认关闭 KasmVNC 的 GPU 硬件编码（baseimage 检测到 /dev/dri/renderD* 时会给 Xvnc 加 -hw3d）：
@@ -122,7 +122,7 @@ function realisticMac(id: string): string {
   return (oui + tail).match(/.{2}/g)!.join(':');
 }
 
-const docker = new Docker(); // 默认连 /var/run/docker.sock
+export const docker = new Docker(); // 默认连 /var/run/docker.sock
 
 // 启动时等 Docker 可用。socket-proxy 加固部署下，宿主重启或 compose 同时重建代理和面板时，面板常比代理先起来，
 // 头几秒解析不到 / 连不上代理；不等的话启动流程全部落空：没接上实例专用网络（实例桌面 502，要等之后的定期复查
@@ -156,7 +156,18 @@ export async function waitForDocker(maxMs = 30_000): Promise<boolean> {
 // 实例接入的 docker 网络名。默认是实例专用网络（见 ensureNetwork）；WOC_DOCKER_NETWORK 显式指定时用指定的。
 const EXPLICIT_NETWORK = (process.env.WOC_DOCKER_NETWORK || '').trim() || null;
 const INSTANCE_NETWORK = (process.env.WOC_INSTANCE_NETWORK || '').trim() || 'woc-instances';
+export const ADDON_NETWORK = (process.env.WOC_ADDON_NETWORK || '').trim() || 'woc-addons';
 let networkName: string | null = null;
+
+export interface AddonLifecycleHooks {
+  ensureAddons: (inst: Instance) => Promise<void>;
+  stopAddons: (inst: Instance) => Promise<void>;
+  removeAddons: (inst: Instance, purgeVolume: boolean) => Promise<void>;
+}
+let addonHooks: AddonLifecycleHooks | null = null;
+export function registerAddonLifecycle(hooks: AddonLifecycleHooks): void {
+  addonHooks = hooks;
+}
 
 export type RuntimeState = 'running' | 'stopped' | 'missing';
 
@@ -247,13 +258,12 @@ async function attachSelfToInstanceNetwork(self: any): Promise<void> {
   isolatedNet = cfg ? { subnet: String(cfg.Subnet), gateway: String(cfg.Gateway || '') } : null;
 }
 
-// 请求是否来自实例（专用网络网段内、且不是网关——经宿主转发进来的请求源地址是网关）。实例从不需要访问面板，
-// 拦掉可以让被攻破的实例碰不到面板的登录与接口。
-export function isFromInstanceNetwork(addr: string | undefined): boolean {
-  if (!isolatedNet || !addr) return false;
+// 请求是否来自某个专用网络的容器（网段内且不是网关——经宿主端口映射转发进来的请求源地址是网关）。
+function ipInNet(netInfo: { subnet: string; gateway: string } | null, addr: string | undefined): boolean {
+  if (!netInfo || !addr) return false;
   const ip = addr.replace(/^::ffff:/, '');
-  if (!ip || ip === isolatedNet.gateway || ip.includes(':')) return false;
-  const [base, bits] = isolatedNet.subnet.split('/');
+  if (!ip || ip === netInfo.gateway || ip.includes(':')) return false;
+  const [base, bits] = netInfo.subnet.split('/');
   const toInt = (x: string) => x.split('.').reduce((a, o) => (a << 8) + (Number(o) & 255), 0) >>> 0;
   const n = Number(bits);
   if (!(n >= 0 && n <= 32)) return false;
@@ -261,20 +271,99 @@ export function isFromInstanceNetwork(addr: string | undefined): boolean {
   return ((toInt(ip) & mask) >>> 0) === ((toInt(base) & mask) >>> 0);
 }
 
+// 请求是否来自实例（专用网络网段内、且不是网关）。实例从不需要访问面板，
+// 拦掉可以让被攻破的实例碰不到面板的登录与接口。
+export function isFromInstanceNetwork(addr: string | undefined): boolean {
+  return ipInNet(isolatedNet, addr);
+}
+
 export function instanceNetworkName(): string | null {
   return isolatedNet ? INSTANCE_NETWORK : null;
 }
 
+// ---------- 插件专用网络（woc-addons） ----------
+// 插件 sidecar 接入 woc-addons，面板自身也接入并注册 woc-panel 别名；
+// onRequest 钩子对来自该网段的请求仅放行 /api/addon/v1/ 前缀，其余一律 403（§6 #11 / §9）。
+let addonNet: { subnet: string; gateway: string } | null = null;
+let addonNetName: string | null = null;
+let ensuringAddonNet: Promise<string | null> | null = null;
+
+async function attachSelfToAddonNetwork(self: any): Promise<void> {
+  const net = docker.getNetwork(ADDON_NETWORK);
+  let info: any = await net.inspect().catch((e: any) => {
+    if (e?.statusCode === 404) return null;
+    throw e;
+  });
+  if (!info) {
+    await docker
+      .createNetwork({ Name: ADDON_NETWORK, Driver: 'bridge', CheckDuplicate: true, Labels: { 'com.wechatoncloud.role': 'addons' } } as any)
+      .catch((e: any) => {
+        if (e?.statusCode !== 409) throw e;
+      });
+    info = await net.inspect();
+    appendPanelLog('INFO', `已创建插件专用网络 ${ADDON_NETWORK}（仅放行 /api/addon/v1/ 控制面接口）`);
+  }
+  if (!netsOf(self).includes(ADDON_NETWORK)) {
+    try {
+      await net.connect({
+        Container: self.Id,
+        EndpointConfig: { GwPriority: -1, Aliases: ['woc-panel'] },
+      } as any);
+    } catch (e: any) {
+      if (!/already exists|already attached/i.test(String(e?.message))) throw e;
+    }
+  }
+  const cfg = (info?.IPAM?.Config || []).find((c: any) => c?.Subnet && !String(c.Subnet).includes(':'));
+  addonNet = cfg ? { subnet: String(cfg.Subnet), gateway: String(cfg.Gateway || '') } : null;
+  addonNetName = ADDON_NETWORK;
+}
+
+export function isFromAddonNetwork(addr: string | undefined): boolean {
+  return ipInNet(addonNet, addr);
+}
+
+export function ensureAddonNetwork(): Promise<string | null> {
+  if (addonNetName && addonNet) return Promise.resolve(addonNetName);
+  if (!ensuringAddonNet) {
+    ensuringAddonNet = (async () => {
+      const self = await inspectSelf();
+      if (self) {
+        try {
+          await attachSelfToAddonNetwork(self);
+          return ADDON_NETWORK;
+        } catch (e: any) {
+          warnNetworkOnce('addon-net', `没能建立插件专用网络 ${ADDON_NETWORK}（${oneLine(String(e?.message || e))}）`);
+        }
+      } else {
+        // 本地宿主机直跑 tsx 调试时 self 为 null：仍确保 woc-addons 网络本身存在供 sidecar 加入
+        const net = docker.getNetwork(ADDON_NETWORK);
+        let info: any = await net.inspect().catch(() => null);
+        if (!info) {
+          await docker
+            .createNetwork({ Name: ADDON_NETWORK, Driver: 'bridge', CheckDuplicate: true, Labels: { 'com.wechatoncloud.role': 'addons' } } as any)
+            .catch(() => {});
+          info = await net.inspect().catch(() => null);
+        }
+        const cfg = (info?.IPAM?.Config || []).find((c: any) => c?.Subnet && !String(c.Subnet).includes(':'));
+        addonNet = cfg ? { subnet: String(cfg.Subnet), gateway: String(cfg.Gateway || '') } : null;
+        if (info) return (addonNetName = ADDON_NETWORK);
+      }
+      return null;
+    })().finally(() => (ensuringAddonNet = null));
+  }
+  return ensuringAddonNet;
+}
+
 // 本机 Docker 网络的网段（登录限速判断「对端是不是反代」用）：宿主上的反代（NAS 自带的反代、frpc）经网关地址进来，
 // 容器里的反代（Nginx Proxy Manager、1Panel 的 OpenResty、cloudflared 等）是某个 Docker 网络里的地址。
-// 实例专用网络只算网关（经宿主转发进来的请求源地址是它）：实例不是反代。
+// 实例与插件专用网络只算网关（经宿主转发进来的请求源地址是它）：实例与插件容器不是反代。
 export async function dockerProxySubnets(): Promise<string[]> {
   const out: string[] = [];
   try {
     const nets: any[] = await docker.listNetworks();
     for (const n of nets) {
       for (const c of n?.IPAM?.Config || []) {
-        if (n?.Name === INSTANCE_NETWORK) {
+        if (n?.Name === INSTANCE_NETWORK || n?.Name === ADDON_NETWORK) {
           if (c?.Gateway) out.push(String(c.Gateway));
         } else if (c?.Subnet) out.push(String(c.Subnet));
       }
@@ -284,7 +373,9 @@ export async function dockerProxySubnets(): Promise<string[]> {
     const self = await inspectSelf().catch(() => null);
     for (const [name, ep] of Object.entries<any>(self?.NetworkSettings?.Networks || {})) {
       if (ep?.Gateway) out.push(String(ep.Gateway));
-      if (name !== INSTANCE_NETWORK && ep?.IPAddress && ep?.IPPrefixLen) out.push(`${ep.IPAddress}/${ep.IPPrefixLen}`);
+      if (name !== INSTANCE_NETWORK && name !== ADDON_NETWORK && ep?.IPAddress && ep?.IPPrefixLen) {
+        out.push(`${ep.IPAddress}/${ep.IPPrefixLen}`);
+      }
     }
   }
   return out;
@@ -299,7 +390,11 @@ export function watchInstanceNetwork(): void {
   const tick = async () => {
     const self = await inspectSelf().catch(() => null);
     if (!self) return;
-    const attached = netsOf(self).includes(INSTANCE_NETWORK);
+    const nets = netsOf(self);
+    if (!nets.includes(ADDON_NETWORK) || !addonNet) {
+      await attachSelfToAddonNetwork(self).catch(() => {});
+    }
+    const attached = nets.includes(INSTANCE_NETWORK);
     if (attached && isolatedNet && networkName === INSTANCE_NETWORK) return;
     const was = networkName === INSTANCE_NETWORK;
     try {
@@ -333,6 +428,9 @@ async function resolveNetwork(): Promise<string | null> {
   if (EXPLICIT_NETWORK) return (networkName = EXPLICIT_NETWORK);
   const self = await inspectSelf();
   if (self) {
+    await attachSelfToAddonNetwork(self).catch((e: any) => {
+      warnNetworkOnce('addon-net', `没能建立插件专用网络 ${ADDON_NETWORK}（${oneLine(String(e?.message || e))}）`);
+    });
     try {
       await attachSelfToInstanceNetwork(self);
       return (networkName = INSTANCE_NETWORK);
@@ -896,6 +994,11 @@ async function runInstanceNow(inst: Instance, opts?: { keepImage?: boolean }): P
     appendInstanceLog(inst.id, '容器已启动');
     // 容器重建后恢复持久化的字体配置 / xsettingsd
     restoreFontFromVolume(inst).catch(() => {});
+    if (addonHooks) {
+      await addonHooks.ensureAddons(inst).catch((e: any) => {
+        appendInstanceLog(inst.id, `[addon] 启动附加功能失败：${e?.message || e}`);
+      });
+    }
   } catch (e) {
     // 启动失败但容器已被创建出来（Created 状态），不清理的话会成为"幽灵容器"——
     // 它仍占着卷名 woc-data-<id>，让后续删卷报 409。修复 #23 时发现 4 个此类残留。
@@ -915,6 +1018,11 @@ async function restartInPlace(inst: Instance, c: Docker.Container, image: string
   await execCapture(inst, ['sh', '-c', 'rm -f /tmp/.X[0-9]*-lock'], 'root').catch(() => {});
   await c.restart({ t: 10 });
   appendInstanceLog(inst.id, '容器已原地重启');
+  if (addonHooks) {
+    await addonHooks.ensureAddons(inst).catch((e: any) => {
+      appendInstanceLog(inst.id, `[addon] 同步附加功能失败：${e?.message || e}`);
+    });
+  }
 }
 
 // 确保实例容器在运行：缺失则按需创建（不会重建已有卷），停止则启动。
@@ -929,11 +1037,18 @@ export async function ensureRunning(inst: Instance): Promise<void> {
     if (e?.statusCode !== 404) throw e;
     return runInstance(inst);
   }
-  if (info.State?.Running) return;
-  try {
-    await c.start();
-  } catch {
-    await runInstance(inst);
+  if (!info.State?.Running) {
+    try {
+      await c.start();
+    } catch {
+      await runInstance(inst);
+      return;
+    }
+  }
+  if (addonHooks) {
+    await addonHooks.ensureAddons(inst).catch((e: any) => {
+      appendInstanceLog(inst.id, `[addon] 启动附加功能失败：${e?.message || e}`);
+    });
   }
 }
 
@@ -1100,6 +1215,9 @@ async function stopGracefully(c: Docker.Container): Promise<void> {
 
 // 停止实例容器（保留容器与数据卷，可再启动）。
 export async function stopInstance(inst: Instance): Promise<void> {
+  if (addonHooks) {
+    await addonHooks.stopAddons(inst).catch(() => {});
+  }
   try {
     await docker.getContainer(inst.containerName).stop({ t: STOP_GRACE_SEC } as any);
     appendInstanceLog(inst.id, '容器已停止');
@@ -1109,6 +1227,9 @@ export async function stopInstance(inst: Instance): Promise<void> {
 }
 
 export async function removeInstance(inst: Instance, purgeVolume: boolean): Promise<void> {
+  if (addonHooks) {
+    await addonHooks.removeAddons(inst, purgeVolume).catch(() => {});
+  }
   try {
     const c = docker.getContainer(inst.containerName);
     if (!purgeVolume) await stopGracefully(c); // 数据卷还要留着用：让应用把数据写完再走
@@ -2409,6 +2530,238 @@ export async function keyInInstance(inst: Instance, key: string): Promise<void> 
   await withClipLock(inst.id, async () => {
     if (cancelClipRestore(inst.id)) await restoreClipboard(inst);
     await execCapture(inst, ['sh', '-c', cmd]);
+  });
+}
+
+// ---------- Addon 控制面白名单动作（文件传输助手链接法刷新 key / 登录态检测 / 重启微信） ----------
+export function assertWechatMpUrl(rawUrl: unknown): string {
+  const s = typeof rawUrl === 'string' ? rawUrl.trim() : '';
+  if (!s || s.length > 2048 || /[\s\0]/.test(s)) {
+    const err: any = new Error('url 参数不合法');
+    err.statusCode = 400;
+    throw err;
+  }
+  let u: URL;
+  try {
+    u = new URL(s);
+  } catch {
+    const err: any = new Error('url 格式不合法');
+    err.statusCode = 400;
+    throw err;
+  }
+  if ((u.protocol !== 'https:' && u.protocol !== 'http:') || u.hostname.toLowerCase() !== 'mp.weixin.qq.com' || u.username || u.password) {
+    const err: any = new Error('仅允许打开 mp.weixin.qq.com 域名下的微信公众号链接');
+    err.statusCode = 400;
+    throw err;
+  }
+  return u.toString();
+}
+
+// 检测 Linux 微信（4.1+）是否已进入登录后的主窗口：
+// 扫码登录窗同样是 WM_CLASS="wechat" 但尺寸约 380x520；登录后的主界面尺寸 >= 700x500。
+const FIND_WECHAT_MAIN_SH = [
+  'WIN=""',
+  'WX=0; WY=0; WW=0; WH=0',
+  'for w in $(xdotool search --onlyvisible --class "^wechat$" 2>/dev/null || true); do',
+  '  eval "$(xdotool getwindowgeometry --shell "$w" 2>/dev/null || true)"',
+  '  if [ "${WIDTH:-0}" -ge 700 ] && [ "${HEIGHT:-0}" -ge 500 ]; then',
+  '    WIN="$w"; WX="${X:-0}"; WY="${Y:-0}"; WW="$WIDTH"; WH="$HEIGHT"; break',
+  '  fi',
+  'done',
+].join('\n');
+
+export async function checkWechatLoggedIn(inst: Instance): Promise<{ loggedIn: boolean; reason?: string }> {
+  try {
+    const out = await execCapture(inst, [
+      'sh',
+      '-c',
+      [
+        ...X_PRELUDE,
+        FIND_WECHAT_MAIN_SH,
+        'if [ -n "$WIN" ]; then echo "LOGGED_IN=1"; else echo "LOGGED_IN=0"; fi',
+      ].join('\n'),
+    ]);
+    const loggedIn = /LOGGED_IN=1/.test(out);
+    return loggedIn ? { loggedIn: true } : { loggedIn: false, reason: '未检测到微信已登录主窗口（可能未启动或处于扫码登录界面）' };
+  } catch (e: any) {
+    return { loggedIn: false, reason: e?.message || '无法检测微信窗口状态' };
+  }
+}
+
+export async function restartWechatProcess(inst: Instance): Promise<void> {
+  await execCapture(inst, ['sh', '-c', 'pkill -f "/opt/wechat/wechat" || true']);
+}
+
+// 在实例内执行「文件传输助手链接法」使微信客户端访问一次公众号链接并刷新缓存中的会话 key：
+// 1) 严格用 --class "^wechat$" 区分主窗口与内置浏览器 WeChatAppEx（两者 WM_NAME 均为「微信」）；
+// 2) 严禁向微信主窗口发 Escape（Linux 微信主窗口收到 Escape 会弹出「退出登录？」确认框）；
+// 3) Ctrl+F 搜「文件传输助手」后识别下拉框唯一的 #07C160 微信绿图标点击进入（避免新号首项落到「搜一搜」）；
+// 4) 粘贴发送链接后向上扫描右侧 #9DF29F 绿色消息气泡并点击，轮询缓存 mtime 更新后关闭 WeChatAppEx 窗口。
+export async function refreshArticleViaFileHelper(
+  inst: Instance,
+  rawUrl: string,
+  shouldAbort?: () => boolean,
+): Promise<{ ok: true; refreshed: boolean }> {
+  const validUrl = assertWechatMpUrl(rawUrl);
+  const urlB64 = Buffer.from(validUrl, 'utf8').toString('base64');
+  const helperNameB64 = Buffer.from('文件传输助手', 'utf8').toString('base64');
+
+  return withClipLock(inst.id, async () => {
+    cancelClipRestore(inst.id);
+    try {
+      // 第一阶段：检查登录态 + 记录刷新前缓存 mtime + 打开「文件传输助手」会话
+      const step1Cmd = [
+        ...X_PRELUDE,
+        CLIP_SAVE,
+        FIND_WECHAT_MAIN_SH,
+        'if [ -z "$WIN" ]; then echo "ERR_CODE=LOGIN_REQUIRED" >&2; exit 42; fi',
+        'for bw in $(xdotool search --onlyvisible --class "WeChatAppEx" 2>/dev/null || true); do xdotool windowclose "$bw" 2>/dev/null || true; done',
+        'BEFORE_NS=$(python3 -c \'import os,glob; ps=glob.glob("/config/.xwechat/radium/web/profiles/**/Favicons*",recursive=True)+glob.glob("/config/.xwechat/radium/web/profiles/**/Share Data*",recursive=True); print(max([os.stat(p).st_mtime_ns for p in ps if os.path.exists(p)] or [0]))\' 2>/dev/null || echo 0)',
+        'xdotool windowactivate --sync "$WIN"',
+        'sleep 0.15',
+        xdoKey('ctrl+f'),
+        'sleep 0.2',
+        xdoKey('ctrl+a'),
+        xdoKey('BackSpace'),
+        `echo '${helperNameB64}' | base64 -d > ${CLIP_DIR}/typed.txt`,
+        `xclip -selection clipboard -i ${CLIP_DIR}/typed.txt >/dev/null 2>&1`,
+        'sleep 0.08',
+        xdoKey('ctrl+v'),
+        'sleep 0.8',
+        'POS=$(ffmpeg -loglevel error -f x11grab -video_size "${WW}x${WH}" -i "${DISPLAY}+${WX},${WY}" -frames:v 1 -f image2pipe -vcodec ppm - | python3 -c \'',
+        'import sys',
+        'data = sys.stdin.buffer.read()',
+        'idx = 0',
+        'toks = []',
+        'while len(toks) < 4 and idx < len(data):',
+        '    while idx < len(data) and data[idx] in b" \\t\\r\\n": idx += 1',
+        '    if idx < len(data) and data[idx] == 35:',
+        '        while idx < len(data) and data[idx] != 10: idx += 1',
+        '        continue',
+        '    s = idx',
+        '    while idx < len(data) and data[idx] not in b" \\t\\r\\n": idx += 1',
+        '    if idx > s: toks.append(data[s:idx])',
+        'w, h = int(toks[1]), int(toks[2])',
+        'pix = memoryview(data)[idx + 1:]',
+        'xs, ys = [], []',
+        'xmax = min(220, w // 2)',
+        'ymax = min(h - 60, 680)',
+        'for y in range(65, ymax, 2):',
+        '    row = y * w * 3',
+        '    for x in range(25, xmax, 2):',
+        '        p = row + x * 3',
+        '        r, g, b = pix[p], pix[p+1], pix[p+2]',
+        '        if r < 55 and g > 165 and 60 <= b <= 135:',
+        '            xs.append(x); ys.append(y)',
+        'if len(xs) >= 8:',
+        '    xs.sort(); ys.sort()',
+        '    print(f"{xs[len(xs)//2] + 65} {ys[len(ys)//2]}")',
+        'else:',
+        '    print("135 125")',
+        '\')',
+        'CX=$(echo "$POS" | awk \'{print $1}\')',
+        'CY=$(echo "$POS" | awk \'{print $2}\')',
+        'xdotool mousemove --sync $((WX + CX)) $((WY + CY)) click 1',
+        'sleep 0.5',
+        'echo "BEFORE_NS=$BEFORE_NS"',
+      ].join('\n');
+
+      let step1Out = '';
+      try {
+        step1Out = await execCapture(inst, ['sh', '-c', step1Cmd]);
+      } catch (e: any) {
+        const msg = String(e?.message || e);
+        if (msg.includes('LOGIN_REQUIRED')) {
+          const err: any = new Error('微信尚未登录或登录态已失效，请进入桌面扫码登录');
+          err.statusCode = 409;
+          err.code = 'LOGIN_REQUIRED';
+          throw err;
+        }
+        throw e;
+      }
+
+      if (shouldAbort?.()) {
+        const err: any = new Error('检测到用户正在远程操作桌面，已中止自动刷新');
+        err.statusCode = 409;
+        err.code = 'CONTROL_BUSY';
+        throw err;
+      }
+
+      const beforeNs = (step1Out.match(/BEFORE_NS=(\d+)/)?.[1]) || '0';
+
+      // 第二阶段：粘贴发送文章/主页链接 → 点击底部绿色消息气泡打开内置浏览器 → 等待缓存落盘并关闭浏览器窗口
+      const step2Cmd = [
+        ...X_PRELUDE,
+        FIND_WECHAT_MAIN_SH,
+        'if [ -z "$WIN" ]; then echo "ERR_CODE=LOGIN_REQUIRED" >&2; exit 42; fi',
+        'xdotool windowactivate --sync "$WIN"',
+        'IN_X=$((WW - 300)); if [ "$IN_X" -lt 480 ]; then IN_X=480; fi',
+        'IN_Y=$((WH - 85))',
+        'xdotool mousemove --sync $((WX + IN_X)) $((WY + IN_Y)) click 1',
+        'sleep 0.15',
+        xdoKey('ctrl+a'),
+        xdoKey('BackSpace'),
+        `echo '${urlB64}' | base64 -d > ${CLIP_DIR}/typed.txt`,
+        `xclip -selection clipboard -i ${CLIP_DIR}/typed.txt >/dev/null 2>&1`,
+        'sleep 0.08',
+        xdoKey('ctrl+v'),
+        'sleep 0.25',
+        xdoKey('Return'),
+        'sleep 0.9',
+        'BPOS=$(ffmpeg -loglevel error -f x11grab -video_size "${WW}x${WH}" -i "${DISPLAY}+${WX},${WY}" -frames:v 1 -f image2pipe -vcodec ppm - | python3 -c \'',
+        'import sys',
+        'data = sys.stdin.buffer.read()',
+        'idx = 0; toks = []',
+        'while len(toks) < 4 and idx < len(data):',
+        '    while idx < len(data) and data[idx] in b" \\t\\r\\n": idx += 1',
+        '    if idx < len(data) and data[idx] == 35:',
+        '        while idx < len(data) and data[idx] != 10: idx += 1',
+        '        continue',
+        '    s = idx',
+        '    while idx < len(data) and data[idx] not in b" \\t\\r\\n": idx += 1',
+        '    if idx > s: toks.append(data[s:idx])',
+        'w, h = int(toks[1]), int(toks[2])',
+        'pix = memoryview(data)[idx + 1:]',
+        'xmin = min(380, w // 2)',
+        'xmax = max(xmin + 40, w - 55)',
+        'found = None',
+        'for y in range(h - 150, 75, -2):',
+        '    row = y * w * 3',
+        '    gx = []',
+        '    for x in range(xmin, xmax, 2):',
+        '        p = row + x * 3',
+        '        r, g, b = pix[p], pix[p+1], pix[p+2]',
+        '        if 125 <= r <= 195 and 210 <= g <= 255 and 80 <= b <= 195 and g > r + 40 and g > b + 35:',
+        '            gx.append(x)',
+        '    if len(gx) >= 12:',
+        '        found = (gx[len(gx)//2], max(80, y - 14))',
+        '        break',
+        'if found:',
+        '    print(f"{found[0]} {found[1]}")',
+        'else:',
+        '    print(f"{max(500, w - 260)} {max(120, h - 220)}")',
+        '\')',
+        'BX=$(echo "$BPOS" | awk \'{print $1}\')',
+        'BY=$(echo "$BPOS" | awk \'{print $2}\')',
+        'xdotool mousemove --sync $((WX + BX)) $((WY + BY)) click 1',
+        'REFRESHED=0',
+        'i=0',
+        'while [ "$i" -lt 14 ]; do',
+        '  sleep 0.5',
+        '  NOW_NS=$(python3 -c \'import os,glob; ps=glob.glob("/config/.xwechat/radium/web/profiles/**/Favicons*",recursive=True)+glob.glob("/config/.xwechat/radium/web/profiles/**/Share Data*",recursive=True); print(max([os.stat(p).st_mtime_ns for p in ps if os.path.exists(p)] or [0]))\' 2>/dev/null || echo 0)',
+        `  if [ "$NOW_NS" -gt "${beforeNs}" ] 2>/dev/null; then REFRESHED=1; sleep 0.8; break; fi`,
+        '  i=$((i + 1))',
+        'done',
+        'for bw in $(xdotool search --onlyvisible --class "WeChatAppEx" 2>/dev/null || true); do xdotool windowclose "$bw" 2>/dev/null || true; done',
+        'echo "REFRESHED=$REFRESHED"',
+      ].join('\n');
+
+      const step2Out = await execCapture(inst, ['sh', '-c', step2Cmd]);
+      const refreshed = /REFRESHED=1/.test(step2Out);
+      return { ok: true, refreshed };
+    } finally {
+      await restoreClipboard(inst);
+    }
   });
 }
 

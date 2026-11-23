@@ -4,7 +4,7 @@ import fstatic from '@fastify/static';
 import httpProxy from 'http-proxy';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { BlockList, isIP } from 'node:net';
 import type { ClientRequest, IncomingMessage } from 'node:http';
 import type { Socket } from 'node:net';
@@ -31,8 +31,11 @@ import {
   renameInstance,
   setInstanceIcon,
   setInstanceUsers,
+  setInstanceAddons,
+  rotateInstanceAddonTokens,
   setInstanceCreateError,
   publicInstance,
+  instanceAppType,
   getDesktopDark,
   setDesktopDark,
   APP_TYPES,
@@ -47,6 +50,11 @@ import {
   waitForDocker,
   recoverInterruptedRestores,
   isFromInstanceNetwork,
+  isFromAddonNetwork,
+  assertWechatMpUrl,
+  checkWechatLoggedIn,
+  refreshArticleViaFileHelper,
+  restartWechatProcess,
   dockerProxySubnets,
   inspectSelf,
   ensureRunning,
@@ -126,6 +134,15 @@ import { CURRENT_VERSION, versionInfo, ensureChecked, checkForUpdate, startUpdat
 import { triggerSelfUpdate } from './self-update.js';
 import { GiB, MiB, readBody, receiveFile, spoolUpload, cleanSpoolDir, type Spooled } from './upload.js';
 import { appendInstanceLog, readInstanceLog, appendPanelLog, readPanelLog, pruneOldLogs, filterSince, rangeToMs, DIAG_RANGES } from './logs.js';
+import {
+  addonContainerName,
+  ensureAddons,
+  getInstanceAddonStatuses,
+  listCatalogAddons,
+  reconcileAllAddons,
+  sanitizeInstalledAddons,
+  verifyAddonRequestToken,
+} from './addons.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -136,8 +153,11 @@ const COOKIE = 'woc_sess';
 // Public hostnames the panel will accept Host headers for, in addition to the
 // always-on loopback + RFC1918 LAN allowlist. Required for HTTPS reverse-proxy
 // deploys (Caddy/nginx/飞牛 内置反代) where the public hostname differs from
-// the LAN IP. See .env.example.
-const ALLOWED_HOSTS = parseAllowedHosts(process.env.PANEL_ALLOWED_HOSTS);
+// the LAN IP. Also includes internal panel container hostname `woc-panel` so
+// sidecars on `woc-addons` can call `/api/addon/v1/*` via `http://woc-panel:8080` (§15.2).
+const ALLOWED_HOSTS = parseAllowedHosts(
+  [process.env.PANEL_ALLOWED_HOSTS, 'woc-panel', process.env.WOC_PANEL_CONTAINER].filter(Boolean).join(','),
+);
 
 function basicAuth(inst: Instance) {
   return 'Basic ' + Buffer.from(`${inst.kasmUser}:${inst.kasmPassword}`).toString('base64');
@@ -148,9 +168,16 @@ cleanSpoolDir(); // 上次异常退出时没收完 / 没处理完的上传暂存
 
 const app = Fastify({ logger: true, trustProxy: true });
 
-// 实例从不需要访问面板：来自实例专用网络的请求一律拒绝，被攻破的实例碰不到面板的登录与接口（见 docker.ts ensureNetwork）
+// 实例从不需要访问面板：来自实例专用网络的请求一律拒绝，被攻破的实例碰不到面板的登录与接口（见 docker.ts ensureNetwork）。
+// 来自插件专用网络（woc-addons）的请求仅放行 /api/addon/v1/ 控制面接口，其余路径一律 403（§6 #11 / §15.3）。
 app.addHook('onRequest', async (req, reply) => {
-  if (isFromInstanceNetwork(req.socket.remoteAddress)) {
+  const addr = req.socket.remoteAddress;
+  if (isFromInstanceNetwork(addr)) {
+    reply.header('connection', 'close').code(403).send({ error: 'forbidden' });
+    return reply;
+  }
+  const rawUrl = req.raw.url || req.url || '';
+  if (isFromAddonNetwork(addr) && !rawUrl.startsWith('/api/addon/v1/')) {
     reply.header('connection', 'close').code(403).send({ error: 'forbidden' });
     return reply;
   }
@@ -499,14 +526,22 @@ app.get('/api/instances', async (req, reply) => {
   const visible = userInstances(u);
   const out = await Promise.all(
     visible.map(async (inst) => {
-      const [runtime, wx, imageVersion] = await Promise.all([
+      const [runtime, wx, imageVersion, addonStatuses] = await Promise.all([
         instanceRuntime(inst),
         wechatStatus(inst),
         instanceImageVersion(inst), // 实例镜像版本（CI label；自构建为短 id）——让用户能自查"到底跑的哪版"
+        getInstanceAddonStatuses(inst),
       ]);
       // 只下发 publicInstance：此前直接展开整条记录，连 kasm 凭据（store 里注明「永不下发前端」）和创建失败的原始报错也带给了浏览器
       const provision = provisionView(inst, runtime, u.role === 'admin');
-      return { ...publicInstance(inst), runtime, wechat: wx, imageVersion, ...(provision ? { provision } : {}) };
+      return {
+        ...publicInstance(inst),
+        runtime,
+        wechat: wx,
+        imageVersion,
+        ...(addonStatuses.length ? { addonStatuses } : {}),
+        ...(provision ? { provision } : {}),
+      };
     }),
   );
   return { instances: out };
@@ -600,12 +635,18 @@ app.post('/api/instances/:id/clientlog', async (req, reply) => {
 app.post('/api/admin/instances', async (req, reply) => {
   const admin = requireAdmin(req, reply);
   if (!admin) return;
-  const { name, reuseVolume, appType } = (req.body as any) ?? {};
+  const { name, reuseVolume, appType, addons: rawAddons } = (req.body as any) ?? {};
   const allowedUserIds = Array.isArray((req.body as any)?.allowedUserIds) ? (req.body as any).allowedUserIds : [];
   // 名称可留空（自动命名为「微信 1」这类，见 store.ts）；新建弹窗的占位文字一直写着「留空自动命名」，此前却必填
   const instName = typeof name === 'string' ? name.trim() : '';
   if (instName.length > 30) return reply.code(400).send({ error: '实例名称最多 30 个字符' });
   const type: AppType = APP_TYPES.includes(appType) ? appType : 'wechat';
+  let addons;
+  try {
+    addons = sanitizeInstalledAddons(rawAddons, type);
+  } catch (e: any) {
+    return reply.code(e?.statusCode || 400).send({ error: e?.message || '插件参数不合法' });
+  }
   // 复用卷：必须以 woc-data- 开头，且不能被现存实例占用。后端先校验，避免坏名穿透到 docker run。
   let reuseVolumeName: string | undefined;
   if (reuseVolume) {
@@ -617,15 +658,79 @@ app.post('/api/admin/instances', async (req, reply) => {
     }
     reuseVolumeName = reuseVolume;
   }
-  const inst = createInstance(instName, admin.id, allowedUserIds, reuseVolumeName, type);
+  const inst = createInstance(instName, admin.id, allowedUserIds, reuseVolumeName, type, addons);
   appendPanelLog(
     'INFO',
-    `创建实例「${inst.name}」(${type}, id=${inst.id}) by ${admin.username}${reuseVolumeName ? ` · 复用卷 ${reuseVolumeName}` : ''} → 开始创建容器（镜像缺失会自动拉取，首次较慢）`,
+    `创建实例「${inst.name}」(${type}, id=${inst.id}) by ${admin.username}${reuseVolumeName ? ` · 复用卷 ${reuseVolumeName}` : ''}${addons.length ? ` · 插件 ${addons.map((a) => a.id).join(',')}` : ''} → 开始创建容器（镜像缺失会自动拉取，首次较慢）`,
   );
-  appendInstanceLog(inst.id, `实例创建（${type}）by ${admin.username}`);
+  appendInstanceLog(inst.id, `实例创建（${type}）by ${admin.username}${addons.length ? ` · 启用插件 ${addons.map((a) => a.id).join(',')}` : ''}`);
   // 不再同步等容器建好、失败也不再回滚登记（#129）：后台创建，失败时卡片显示原因 + 重试，见 startProvision
   startProvision(inst, '创建');
   return { instance: publicInstance(inst), started: true };
+});
+
+// 列出可用插件目录（manifest v1，仅管理员）
+app.get('/api/admin/addons', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  return { addons: listCatalogAddons() };
+});
+
+// 更新某实例启用的附加功能（仅管理员）：勾选即拉起/重建对应 sidecar，取消勾选即停止并移除 sidecar（保留输出卷）
+app.put('/api/admin/instances/:id/addons', async (req, reply) => {
+  const admin = requireAdmin(req, reply);
+  if (!admin) return;
+  const id = (req.params as any).id;
+  const inst = findInstance(id);
+  if (!inst) return reply.code(404).send({ error: '实例不存在' });
+  let addons;
+  try {
+    addons = sanitizeInstalledAddons((req.body as any)?.addons, instanceAppType(inst));
+  } catch (e: any) {
+    return reply.code(e?.statusCode || 400).send({ error: e?.message || '插件参数不合法' });
+  }
+  const updated = setInstanceAddons(id, addons);
+  appendPanelLog(
+    'INFO',
+    `更新实例「${updated.name}」(id=${id}) 插件配置 by ${admin.username}：${addons.length ? addons.map((a) => a.id).join(',') : '已全部关闭'}`,
+  );
+  try {
+    await ensureAddons(updated);
+  } catch (e: any) {
+    return reply.code(500).send({ error: `同步插件容器失败：${e?.message || e}` });
+  }
+  const addonStatuses = await getInstanceAddonStatuses(updated);
+  return { instance: publicInstance(updated), addonStatuses };
+});
+
+// 查看某实例的 MCP 接入端点与 Bearer token（仅管理员）
+app.get('/api/admin/instances/:id/addons/mcp', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const inst = findInstance((req.params as any).id);
+  if (!inst) return reply.code(404).send({ error: '实例不存在' });
+  const enabled = !!(inst.addons || []).some((a) => a.id === 'wxdown-archiver' && a.enabled !== false);
+  return {
+    enabled,
+    path: `/mcp/wxdown/${inst.id}`,
+    mcpToken: inst.mcpToken || '',
+  };
+});
+
+// 轮换某实例的 addonToken 与 mcpToken（仅管理员），自动重启对应 sidecar 使新凭据立即生效
+app.post('/api/admin/instances/:id/addons/mcp/rotate', async (req, reply) => {
+  const admin = requireAdmin(req, reply);
+  if (!admin) return;
+  const id = (req.params as any).id;
+  const inst = findInstance(id);
+  if (!inst) return reply.code(404).send({ error: '实例不存在' });
+  const updated = rotateInstanceAddonTokens(id);
+  appendPanelLog('INFO', `管理员 ${admin.username} 轮换了实例「${updated.name}」(id=${id}) 的插件与 MCP 凭据`);
+  appendInstanceLog(id, `[addon] 插件与 MCP 凭据已由 ${admin.username} 轮换`);
+  await ensureAddons(updated).catch(() => {});
+  return {
+    ok: true,
+    path: `/mcp/wxdown/${updated.id}`,
+    mcpToken: updated.mcpToken || '',
+  };
 });
 
 // 列出"未被任何实例引用的 woc-data-* 数据卷"。删除实例时默认保留卷（聊天记录），但 panel 里
@@ -769,6 +874,7 @@ app.delete('/api/admin/instances/:id', async (req, reply) => {
   await removeInstanceContainer(inst, purge);
   removeInstanceRecord(id);
   controlHolders.delete(id);
+  autoRefreshHolders.delete(id);
   currentViewers.delete(id);
   supersededViewers.delete(id);
   return { ok: true };
@@ -1041,6 +1147,24 @@ app.get('/api/instances/:id/download', async (req, reply) => {
 // 当前操作者每隔几秒 beat 续约；TTL 内他人只读（前端盖只读遮罩）。空闲超 TTL 自动释放。
 const CONTROL_TTL = 10_000; // ms：超过则视为已空闲，可被接管
 const controlHolders = new Map<string, { userId: string; username: string; at: number }>();
+const AUTO_REFRESH_TTL = 20_000; // ms：自动刷新控制面动作占用上限（人工操作始终优先，§15.1）
+const autoRefreshHolders = new Map<string, { at: number }>();
+
+function activeHumanHolder(id: string): { userId: string; username: string; at: number } | null {
+  const h = controlHolders.get(id);
+  if (!h || Date.now() - h.at > CONTROL_TTL) return null;
+  return h;
+}
+
+function isAutoRefreshing(id: string): boolean {
+  const ar = autoRefreshHolders.get(id);
+  if (!ar) return false;
+  if (Date.now() - ar.at > AUTO_REFRESH_TTL) {
+    autoRefreshHolders.delete(id);
+    return false;
+  }
+  return true;
+}
 
 // 续约/认领：无人持有、已超时、或本来就是我 → 我成为操作者；否则返回当前操作者。
 app.post('/api/instances/:id/control/beat', async (req, reply) => {
@@ -1067,9 +1191,10 @@ app.get('/api/instances/:id/control', async (req, reply) => {
   if (!userCanAccess(u, id)) return reply.code(403).send({ error: '无权访问该实例' });
   // 顺带告诉前端：这个页面是否已被别处打开的页面接管（见下方「单连接」）
   const superseded = supersededBy(id, viewerOf(req));
+  const autoRefreshing = isAutoRefreshing(id);
   const h = controlHolders.get(id);
-  if (!h || Date.now() - h.at > CONTROL_TTL) return { free: true, mine: false, holder: null, superseded };
-  return { free: false, mine: h.userId === u.id, holder: h.username, superseded };
+  if (!h || Date.now() - h.at > CONTROL_TTL) return { free: true, mine: false, holder: null, superseded, autoRefreshing };
+  return { free: false, mine: h.userId === u.id, holder: h.username, superseded, autoRefreshing };
 });
 
 // 主动接管（"申请控制"）：强制把操作权抢过来。
@@ -1987,11 +2112,167 @@ const desktopHandler = (req: FastifyRequest, reply: FastifyReply) => {
 app.all('/desktop/:id', desktopHandler);
 app.all('/desktop/:id/*', desktopHandler);
 
+// ---------- Addon API v1（控制面：仅限实例绑定 addonToken 鉴权，§5 / §15.1 / §17.2） ----------
+app.get('/api/addon/v1/instances/:id/status', async (req, reply) => {
+  const id = String((req.params as any).id || '');
+  const auth = verifyAddonRequestToken(req.headers.authorization, id, 'instance-status');
+  if (!auth.ok) return reply.code(auth.statusCode).send({ error: auth.error });
+  const inst = auth.instance;
+  const [runtime, wx, addonStatuses] = await Promise.all([
+    instanceRuntime(inst),
+    wechatStatus(inst),
+    getInstanceAddonStatuses(inst),
+  ]);
+  const login = runtime === 'running' ? await checkWechatLoggedIn(inst) : { loggedIn: false, reason: '实例容器未运行' };
+  return {
+    state: runtime,
+    wechat: { ...wx, loggedIn: login.loggedIn, ...(login.reason ? { loginReason: login.reason } : {}) },
+    addons: addonStatuses,
+  };
+});
+
+app.post('/api/addon/v1/instances/:id/actions/refresh-article', async (req, reply) => {
+  const id = String((req.params as any).id || '');
+  const auth = verifyAddonRequestToken(req.headers.authorization, id, 'refresh-article');
+  if (!auth.ok) return reply.code(auth.statusCode).send({ error: auth.error });
+  const inst = auth.instance;
+
+  let validUrl: string;
+  try {
+    validUrl = assertWechatMpUrl((req.body as any)?.url);
+  } catch (e: any) {
+    return reply.code(e?.statusCode || 400).send({ error: e?.message || 'url 参数不合法' });
+  }
+
+  // 控制权互斥（§15.1）：人工正在远程操作桌面（CONTROL_TTL=10s 内）时立即返回 409，绝不抢焦点
+  const human = activeHumanHolder(id);
+  if (human) {
+    appendInstanceLog(id, `[addon] 跳过自动刷新：用户「${human.username}」正在操作桌面`);
+    return reply.code(409).send({
+      code: 'CONTROL_BUSY',
+      error: `用户「${human.username}」正在远程操作桌面，跳过本次自动刷新`,
+      holder: human.username,
+    });
+  }
+  if (isAutoRefreshing(id)) {
+    return reply.code(409).send({ code: 'REFRESH_BUSY', error: '该实例正在执行自动刷新，请稍候' });
+  }
+  if ((await instanceRuntime(inst)) !== 'running') {
+    return reply.code(409).send({ code: 'INSTANCE_NOT_RUNNING', error: '实例容器未运行' });
+  }
+
+  autoRefreshHolders.set(id, { at: Date.now() });
+  try {
+    appendInstanceLog(id, `[addon] 触发文件传输助手自动刷新密钥`);
+    const res = await refreshArticleViaFileHelper(inst, validUrl, () => !!activeHumanHolder(id));
+    appendInstanceLog(id, `[addon] 自动刷新完成（refreshed=${res.refreshed}）`);
+    return { ok: true, refreshed: res.refreshed };
+  } catch (e: any) {
+    const code = typeof e?.code === 'string' ? e.code : undefined;
+    const status = Number(e?.statusCode) || (code ? 409 : 500);
+    appendInstanceLog(id, `[addon] 自动刷新未完成（${code || status}）：${e?.message || e}`);
+    return reply.code(status).send({ ...(code ? { code } : {}), error: e?.message || '自动刷新失败' });
+  } finally {
+    autoRefreshHolders.delete(id);
+  }
+});
+
+app.post('/api/addon/v1/instances/:id/actions/restart-wechat', async (req, reply) => {
+  const id = String((req.params as any).id || '');
+  const auth = verifyAddonRequestToken(req.headers.authorization, id, 'restart-wechat');
+  if (!auth.ok) return reply.code(auth.statusCode).send({ error: auth.error });
+  const inst = auth.instance;
+  const human = activeHumanHolder(id);
+  if (human) {
+    return reply.code(409).send({
+      code: 'CONTROL_BUSY',
+      error: `用户「${human.username}」正在远程操作桌面，拒绝自动重启微信`,
+      holder: human.username,
+    });
+  }
+  if ((await instanceRuntime(inst)) !== 'running') {
+    return reply.code(409).send({ code: 'INSTANCE_NOT_RUNNING', error: '实例容器未运行' });
+  }
+  await restartWechatProcess(inst);
+  appendInstanceLog(id, '[addon] 已触发重启微信进程');
+  return { ok: true };
+});
+
+// ---------- MCP 按需反向代理（/mcp/wxdown/:id 与单实例默认 /mcp/wxdown，§13.5） ----------
+function verifyMcpBearer(authHeader: string | undefined, expectedToken: string | undefined): boolean {
+  if (!expectedToken) return false;
+  const m = typeof authHeader === 'string' ? authHeader.match(/^Bearer\s+(\S+)$/i) : null;
+  const raw = m?.[1] || '';
+  if (!raw) return false;
+  const a = Buffer.from(raw, 'utf8');
+  const b = Buffer.from(expectedToken, 'utf8');
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+const mcpProxyHandler = async (req: FastifyRequest, reply: FastifyReply) => {
+  const paramId = (req.params as any)?.id as string | undefined;
+  let inst: Instance | undefined;
+  if (paramId) {
+    inst = findInstance(paramId);
+  } else {
+    // 未指定 :id 时：若全局仅一个实例启用了 wxdown-archiver，或凭 Bearer mcpToken 唯一匹配某实例，则自动路由
+    const candidates = listInstances().filter((i) => (i.addons || []).some((a) => a.id === 'wxdown-archiver' && a.enabled !== false));
+    inst = candidates.find((i) => verifyMcpBearer(req.headers.authorization, i.mcpToken)) || (candidates.length === 1 ? candidates[0] : undefined);
+  }
+  if (!inst) {
+    return reply.code(404).send({ error: '未找到启用了 wxdown-archiver 插件的目标实例' });
+  }
+  if (!verifyMcpBearer(req.headers.authorization, inst.mcpToken)) {
+    return reply.code(401).send({ error: '缺少或无效的 MCP Bearer token' });
+  }
+
+  const upstreamUrl = `http://${addonContainerName(inst.id, 'wxdown-archiver')}:4545/mcp`;
+  const fwdHeaders: Record<string, string> = {
+    authorization: String(req.headers.authorization || ''),
+  };
+  for (const h of ['content-type', 'accept', 'mcp-session-id']) {
+    const v = req.headers[h];
+    if (typeof v === 'string' && v) fwdHeaders[h] = v;
+  }
+
+  const bodyAllowed = req.method !== 'GET' && req.method !== 'HEAD';
+  const rawBody = bodyAllowed && req.body !== undefined && req.body !== null
+    ? typeof req.body === 'string' || Buffer.isBuffer(req.body)
+      ? req.body
+      : JSON.stringify(req.body)
+    : undefined;
+
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 55_000);
+  try {
+    const upRes = await fetch(upstreamUrl, {
+      method: req.method,
+      headers: fwdHeaders,
+      body: rawBody as any,
+      signal: ctl.signal,
+    });
+    reply.code(upRes.status);
+    for (const h of ['content-type', 'mcp-session-id']) {
+      const val = upRes.headers.get(h);
+      if (val) reply.header(h, val);
+    }
+    const buf = Buffer.from(await upRes.arrayBuffer());
+    return reply.send(buf);
+  } catch (e: any) {
+    return reply.code(502).send({ error: `MCP sidecar 不可达：${e?.message || e}` });
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+app.all('/mcp/wxdown', mcpProxyHandler);
+app.all('/mcp/wxdown/:id', mcpProxyHandler);
+
 // ---------- 静态 SPA + 前端路由回退 ----------
 await app.register(fstatic, { root: STATIC_DIR, wildcard: false, index: ['index.html'] });
 app.setNotFoundHandler((req, reply) => {
   const url = req.raw.url || '';
-  if (url.startsWith('/api') || url.startsWith('/desktop')) {
+  if (url.startsWith('/api') || url.startsWith('/desktop') || url.startsWith('/mcp')) {
     return reply.code(404).send({ error: 'not found' });
   }
   return reply.sendFile('index.html');
@@ -2041,6 +2322,10 @@ app.server.on('upgrade', (req: IncomingMessage, socket: Socket, head: Buffer) =>
   };
   if (isFromInstanceNetwork(req.socket.remoteAddress)) {
     reject(`来自实例专用网络的连接（${req.socket.remoteAddress}），实例不允许访问面板`);
+    return;
+  }
+  if (isFromAddonNetwork(req.socket.remoteAddress)) {
+    reject(`来自插件专用网络的连接（${req.socket.remoteAddress}），插件不允许访问远程桌面`);
     return;
   }
   // DNS-rebinding gate for WebSocket upgrades (Fastify's onRequest hook does
@@ -2145,6 +2430,8 @@ for (const pub of listInstances()) {
     app.log.warn(`[instance] 启动实例 ${pub.id} 失败: ${e?.message || e}`);
   }
 }
+// 启动后对齐所有已启用插件的 sidecar 容器（宿主重启或配置变更后确保 sidecar 在线，§6 #9）
+await reconcileAllAddons(listInstances().map((p) => findInstance(p.id)!).filter(Boolean)).catch(() => {});
 // 体检：和面板不在同一网络的实例（旧版探测失败时建到 bridge 的，#103）在面板日志里点名，只提示不动实例
 void checkInstanceNetworks(listInstances()).catch(() => {});
 watchInstanceNetwork();

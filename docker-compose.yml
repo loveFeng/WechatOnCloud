@@ -31,6 +31,11 @@ services:
       # 实例接入的 Docker 网络：默认自动建一个实例专用网络（woc-instances）并把面板接上，实例与面板所在的其它网络隔离；一般不用填，见 .env.example
       - WOC_DOCKER_NETWORK=${WOC_DOCKER_NETWORK:-}
       - WOC_INSTANCE_NETWORK=${WOC_INSTANCE_NETWORK:-}
+      - WOC_ADDON_NETWORK=${WOC_ADDON_NETWORK:-}
+      # 附加功能（插件 sidecar）输出目录（宿主绝对路径，按 <路径>/<实例id> 自动隔离；留空默认使用独立 Docker 命名卷）
+      - WOC_ADDON_OUTPUT_ROOT=${WOC_ADDON_OUTPUT_ROOT:-}
+      - PANEL_ADDONS_DIR=${PANEL_ADDONS_DIR:-/data/addons}
+      - WOC_WXDOWN_IMAGE=${WOC_WXDOWN_IMAGE:-wxdown/wxdown-d:1.0.0}
       - WOC_INSTANCE_MEM_GB=${WOC_INSTANCE_MEM_GB:-}
       - WOC_INSTANCE_MEM_SOFT_MB=${WOC_INSTANCE_MEM_SOFT_MB:-1500}
       - WOC_INSTANCE_MEM_HARD_MB=${WOC_INSTANCE_MEM_HARD_MB:-2500}
