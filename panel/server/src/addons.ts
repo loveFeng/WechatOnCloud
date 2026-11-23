@@ -135,7 +135,9 @@ const BUILTIN_MANIFESTS: AddonManifest[] = [
       path: '/mcp',
     },
     resources: {
-      memory: '256m',
+      // 抓取含封面/图片下载与 HTML 解析，256m 会在多篇/大图时触发容器 OOM（die 137，任务丢失）；
+      // 512m 给足余量，仍远低于实例本身。
+      memory: '512m',
     },
   },
 ];
