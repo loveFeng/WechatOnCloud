@@ -2,18 +2,20 @@
 
 # --- 1) 构建前端 ---
 FROM node:22-slim AS web
+ARG NPM_REGISTRY=https://registry.npmmirror.com
 WORKDIR /web
 COPY web/package.json web/package-lock.json ./
-RUN npm ci
+RUN npm ci --registry=${NPM_REGISTRY}
 COPY web/ ./
 RUN npm run build
 
 # --- 2) 后端运行时 ---
 FROM node:22-slim AS runtime
+ARG NPM_REGISTRY=https://registry.npmmirror.com
 WORKDIR /app
 ENV NODE_ENV=production
 COPY server/package.json server/package-lock.json ./
-RUN npm ci --omit=dev
+RUN npm ci --omit=dev --registry=${NPM_REGISTRY}
 COPY server/ ./
 COPY --from=web /web/dist ./web-dist
 
