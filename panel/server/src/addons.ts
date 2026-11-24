@@ -117,8 +117,8 @@ const BUILTIN_MANIFESTS: AddonManifest[] = [
         formats: {
           type: 'string',
           title: '导出格式',
-          placeholder: 'md,html',
-          default: 'md,html',
+          placeholder: 'md（支持 md,html,txt,docx,mhtml）',
+          default: 'md',
         },
       },
     },
@@ -291,7 +291,7 @@ function buildAddonOptionsEnv(addonId: string, rawOptions?: Record<string, unkno
       opts.schedule = '03:30';
     }
     if (typeof opts.formats !== 'string' || !opts.formats.trim()) {
-      opts.formats = 'md,html';
+      opts.formats = 'md';
     }
     // 未填跟踪账号时传空串，使 wxdownd 进入待命/MCP 模式而不报“未配置 accounts”退出
     if (acctList.length === 0) {
