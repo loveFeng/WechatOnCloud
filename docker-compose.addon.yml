@@ -35,8 +35,9 @@ services:
       - PANEL_ADDONS_DIR=${PANEL_ADDONS_DIR:-/data/addons}
 
       # ── 微信实例基础配置（保持上游官方微信镜像不变） ──────────────
-      # 新建微信实例时使用的镜像（amd64/arm64 多架构）；拉不动时可在 .env 设 WOC_IMAGE_PREFIX 切国内镜像站
-      - WOC_WECHAT_IMAGE=${WOC_WECHAT_IMAGE:-${WOC_IMAGE_PREFIX:-docker.io/gloridust}/wechat-on-cloud:${WOC_VERSION:-latest}}
+      # 新建/升级微信实例时使用的镜像（amd64/arm64 多架构）；拉不动时可在 .env 设 WOC_IMAGE_PREFIX 切国内镜像站
+      # （注意：请勿写成嵌套 ${A:-${B}}，部分 NAS 的 Compose 解析器不支持嵌套默认值）
+      - WOC_WECHAT_IMAGE=${WOC_IMAGE_PREFIX:-docker.io/gloridust}/wechat-on-cloud:${WOC_VERSION:-latest}
       # 透传给微信实例与归档目录的属主 UID/GID（NAS 单用户一般为 1000）
       - PUID=${WOC_PUID:-1000}
       - PGID=${WOC_PGID:-1000}
