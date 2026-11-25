@@ -2752,9 +2752,9 @@ export async function refreshArticleViaFileHelper(
         `  if [ "$NOW_NS" -gt "${beforeNs}" ] 2>/dev/null; then REFRESHED=1; sleep 0.8; break; fi`,
         '  i=$((i + 1))',
         'done',
+        // 仅用 windowclose 正常关闭内置浏览器窗口（等同点击右上角 ×，由浏览器自行销毁页面 renderer）：
+        // 严禁 pkill WeChatAppEx 主进程，否则会断开微信主进程与内置浏览器的常驻 IPC 通道，导致后续无法再打开任何网页链接。
         'for bw in $(xdotool search --onlyvisible --class "WeChatAppEx" 2>/dev/null || true); do xdotool windowclose "$bw" 2>/dev/null || true; done',
-        'sleep 0.4',
-        'pkill -TERM -f "[R]adiumWMPF/runtime/WeChatAppEx" 2>/dev/null || true',
         'echo "REFRESHED=$REFRESHED"',
       ].join('\n');
 
