@@ -65,7 +65,7 @@ services:
       - WOC_ENABLE_GPU=${WOC_ENABLE_GPU:-}
       - WOC_DISABLE_IPV6=${WOC_DISABLE_IPV6:-}
       - WOC_INSTANCE_MEM_GB=${WOC_INSTANCE_MEM_GB:-}
-      # 注：已启用「公众号素材归档」的实例会自动回收内置浏览器进程并默认豁免 soft 重启，防止无人值守掉登录
+      # 注：已启用「公众号素材归档」的实例默认豁免 soft 重启（保留 hard OOM 安全阀），防止无人值守掉登录
       - WOC_INSTANCE_MEM_SOFT_MB=${WOC_INSTANCE_MEM_SOFT_MB:-1500}
       - WOC_INSTANCE_MEM_HARD_MB=${WOC_INSTANCE_MEM_HARD_MB:-2500}
       - WOC_WATCHDOG_INTERVAL_SEC=${WOC_WATCHDOG_INTERVAL_SEC:-300}

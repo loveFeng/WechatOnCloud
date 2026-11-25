@@ -2596,7 +2596,7 @@ export async function restartWechatProcess(inst: Instance): Promise<void> {
 // 1) 严格用 --class "^wechat$" 区分主窗口与内置浏览器 WeChatAppEx（两者 WM_NAME 均为「微信」）；
 // 2) 严禁向微信主窗口发 Escape（Linux 微信主窗口收到 Escape 会弹出「退出登录？」确认框）；
 // 3) Ctrl+F 搜「文件传输助手」后识别下拉框唯一的 #07C160 微信绿图标点击进入（避免新号首项落到「搜一搜」）；
-// 4) 粘贴发送链接后向上扫描右侧 #9DF29F 绿色消息气泡并点击，轮询缓存 mtime 更新后关闭 WeChatAppEx 窗口。
+// 4) 粘贴发送链接后向上扫描右侧 #9DF29F 绿色消息气泡并点击，轮询缓存 mtime 更新后发送 Ctrl+W 关标签并将微信主窗口置顶。
 export async function refreshArticleViaFileHelper(
   inst: Instance,
   rawUrl: string,
@@ -2615,7 +2615,6 @@ export async function refreshArticleViaFileHelper(
         CLIP_SAVE,
         FIND_WECHAT_MAIN_SH,
         'if [ -z "$WIN" ]; then echo "ERR_CODE=LOGIN_REQUIRED" >&2; exit 42; fi',
-        'for bw in $(xdotool search --onlyvisible --class "WeChatAppEx" 2>/dev/null || true); do xdotool windowclose "$bw" 2>/dev/null || true; done',
         'BEFORE_NS=$(python3 -c \'import os,glob; ps=glob.glob("/config/.xwechat/radium/web/profiles/**/Favicons*",recursive=True)+glob.glob("/config/.xwechat/radium/web/profiles/**/Share Data*",recursive=True); print(max([os.stat(p).st_mtime_ns for p in ps if os.path.exists(p)] or [0]))\' 2>/dev/null || echo 0)',
         'xdotool windowactivate --sync "$WIN"',
         'sleep 0.15',
@@ -2752,9 +2751,15 @@ export async function refreshArticleViaFileHelper(
         `  if [ "$NOW_NS" -gt "${beforeNs}" ] 2>/dev/null; then REFRESHED=1; sleep 0.8; break; fi`,
         '  i=$((i + 1))',
         'done',
-        // 仅用 windowclose 正常关闭内置浏览器窗口（等同点击右上角 ×，由浏览器自行销毁页面 renderer）：
-        // 严禁 pkill WeChatAppEx 主进程，否则会断开微信主进程与内置浏览器的常驻 IPC 通道，导致后续无法再打开任何网页链接。
-        'for bw in $(xdotool search --onlyvisible --class "WeChatAppEx" 2>/dev/null || true); do xdotool windowclose "$bw" 2>/dev/null || true; done',
+        // 严禁调用 pkill 或 xdotool windowclose（libxdo 的 windowclose 底层调用 XDestroyWindow 强拆顶层及子窗口，
+        // 会触发 WeChatAppEx X11 BadWindow 致命错误崩溃，导致微信主进程与内置浏览器的常驻 IPC 通道断裂）：
+        // 仅在当前聚焦窗口为 WeChatAppEx 时发送一次 Ctrl+W 让浏览器内部正常关闭标签页，再将微信主窗口置顶回前台。
+        'FOCUS_WIN=$(xdotool getwindowfocus 2>/dev/null || true)',
+        'if [ -n "$FOCUS_WIN" ] && [ "$FOCUS_WIN" != "$WIN" ] && xdotool search --onlyvisible --class "WeChatAppEx" 2>/dev/null | grep -qx "$FOCUS_WIN"; then',
+        `  ${xdoKey('ctrl+w')} 2>/dev/null || true`,
+        '  sleep 0.15',
+        'fi',
+        'xdotool windowactivate --sync "$WIN" 2>/dev/null || true',
         'echo "REFRESHED=$REFRESHED"',
       ].join('\n');
 
