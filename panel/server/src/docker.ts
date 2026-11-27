@@ -2592,77 +2592,200 @@ export async function restartWechatProcess(inst: Instance): Promise<void> {
   await execCapture(inst, ['sh', '-c', 'pkill -f "/opt/wechat/wechat" || true']);
 }
 
+// Addon 自动刷新诊断详情，供路由层记录日志并在未确认刷新时透传排障信息
+export interface RefreshArticleDetail {
+  helperPos?: string;
+  bubbleBbox?: string;
+  clickPos?: string;
+  attempts?: number;
+  appexOpened?: boolean;
+  cacheUpdated?: boolean;
+  reason?: string;
+}
+
+// 采集微信内置浏览器核心 SQLite/WAL 缓存文件的最大 mtime_ns（跳过 0 字节 -journal 临时锁文件，防假阳性）
+const READ_WECHAT_CACHE_NS_PY = [
+  'import os, glob',
+  'ps = []',
+  'for pat in ("Share Data", "Share Data-wal", "History", "History-wal", "Favicons", "Favicons-wal"):',
+  '    ps.extend(glob.glob("/config/.xwechat/radium/web/profiles/**/" + pat, recursive=True))',
+  'ns = 0',
+  'for p in ps:',
+  '    try:',
+  '        st = os.stat(p)',
+  '        if st.st_size > 0 and st.st_mtime_ns > ns:',
+  '            ns = st.st_mtime_ns',
+  '    except OSError:',
+  '        pass',
+  'print(ns)',
+].join('\n');
+
+// 在搜索下拉框（x>=60 跳过左侧竖条导航栏的绿色聊天图标）从上往下定位第一个连续 #07C160 微信绿图标块
+const SCAN_FILE_HELPER_ICON_PY = [
+  'import sys',
+  'data = sys.stdin.buffer.read()',
+  'idx = 0; toks = []',
+  'while len(toks) < 4 and idx < len(data):',
+  '    while idx < len(data) and data[idx] in (32, 9, 13, 10): idx += 1',
+  '    if idx < len(data) and data[idx] == 35:',
+  '        while idx < len(data) and data[idx] != 10: idx += 1',
+  '        continue',
+  '    s = idx',
+  '    while idx < len(data) and data[idx] not in (32, 9, 13, 10): idx += 1',
+  '    if idx > s: toks.append(data[s:idx])',
+  'if len(toks) < 3: print("0 0 0"); sys.exit(0)',
+  'w, h = int(toks[1]), int(toks[2])',
+  'pix = memoryview(data)[idx + 1:]',
+  'xmin = 60',
+  'xmax = max(xmin + 30, min(240, w // 2))',
+  'ymax = min(h - 60, 260)',
+  'gy0 = None; gy1 = None; xs_all = []; gap = 0',
+  'for y in range(70, ymax, 2):',
+  '    row = y * w * 3',
+  '    gx = []',
+  '    for x in range(xmin, xmax, 2):',
+  '        p = row + x * 3',
+  '        r, g, b = pix[p], pix[p+1], pix[p+2]',
+  '        if r < 55 and g > 165 and 55 <= b <= 140:',
+  '            gx.append(x)',
+  '    if len(gx) >= 4:',
+  '        if gy0 is None: gy0 = y',
+  '        gy1 = y',
+  '        xs_all.extend(gx)',
+  '        gap = 0',
+  '    elif gy0 is not None:',
+  '        gap += 1',
+  '        if gap >= 4: break',
+  'if gy0 is not None and gy1 is not None and (gy1 - gy0) >= 10 and len(xs_all) >= 12:',
+  '    xs_all.sort()',
+  '    cx = min(xs_all[len(xs_all)//2] + 65, 190)',
+  '    cy = (gy0 + gy1) // 2',
+  '    print(f"1 {cx} {cy}")',
+  'else:',
+  '    print("0 0 0")',
+].join('\n');
+
+// 从聊天区底部向上完整提取最新一颗绿色消息气泡的包围盒 (bx0,by0,bx1,by1)，
+// 并在气泡第 1 行超链接文字像素上生成主点击点与备选重试点（避免多行长链最后一行右侧空白绿底点空）。
+const SCAN_LATEST_BUBBLE_LINK_PY = [
+  'import sys',
+  'data = sys.stdin.buffer.read()',
+  'idx = 0; toks = []',
+  'while len(toks) < 4 and idx < len(data):',
+  '    while idx < len(data) and data[idx] in (32, 9, 13, 10): idx += 1',
+  '    if idx < len(data) and data[idx] == 35:',
+  '        while idx < len(data) and data[idx] != 10: idx += 1',
+  '        continue',
+  '    s = idx',
+  '    while idx < len(data) and data[idx] not in (32, 9, 13, 10): idx += 1',
+  '    if idx > s: toks.append(data[s:idx])',
+  'if len(toks) < 3: print("0 0 0 0 0 0 0 0 0 0"); sys.exit(0)',
+  'w, h = int(toks[1]), int(toks[2])',
+  'pix = memoryview(data)[idx + 1:]',
+  'xmin = max(280, w // 3)',
+  'xmax = max(xmin + 60, w - 70)',
+  'by1 = None; by0 = None; bx0 = w; bx1 = 0; gap = 0',
+  'y_start = max(120, h - 95)',
+  'for y in range(y_start, 75, -2):',
+  '    row = y * w * 3',
+  '    gx = []',
+  '    for x in range(xmin, xmax, 2):',
+  '        p = row + x * 3',
+  '        r, g, b = pix[p], pix[p+1], pix[p+2]',
+  '        if 115 <= r <= 200 and 205 <= g <= 255 and 75 <= b <= 200 and g > r + 35 and g > b + 30:',
+  '            gx.append(x)',
+  '    if len(gx) >= 14:',
+  '        if by1 is None: by1 = y',
+  '        by0 = y',
+  '        if gx[0] < bx0: bx0 = gx[0]',
+  '        if gx[-1] > bx1: bx1 = gx[-1]',
+  '        gap = 0',
+  '    elif by1 is not None:',
+  '        gap += 1',
+  '        if gap >= 3: break',
+  'if by1 is None or by0 is None or bx1 <= bx0:',
+  '    print("0 0 0 0 0 0 0 0 0 0")',
+  'else:',
+  '    ty_top = by0 + 6',
+  '    ty_bot = min(by1 - 4, by0 + 28)',
+  '    tx_left = bx0 + 12',
+  '    tx_right = max(tx_left + 20, bx1 - 12)',
+  '    text_pts = []',
+  '    if ty_bot > ty_top:',
+  '        for y in range(ty_top, ty_bot):',
+  '            row = y * w * 3',
+  '            for x in range(tx_left, tx_right, 2):',
+  '                p = row + x * 3',
+  '                r, g, b = pix[p], pix[p+1], pix[p+2]',
+  '                if g < 200 and r < 145:',
+  '                    text_pts.append((x, y))',
+  '    bh = by1 - by0',
+  '    if text_pts:',
+  '        ys = sorted(pt[1] for pt in text_pts)',
+  '        xs = sorted(pt[0] for pt in text_pts)',
+  '        cx1 = xs[min(len(xs) - 1, max(0, len(xs) // 4))]',
+  '        cy1 = ys[len(ys) // 2]',
+  '    else:',
+  '        cx1 = bx0 + min(60, max(24, (bx1 - bx0) // 3))',
+  '        cy1 = by0 + (18 if bh >= 32 else max(10, bh // 2))',
+  '    cx2 = min(bx1 - 20, cx1 + max(40, min(110, (bx1 - bx0) // 3)))',
+  '    cy2 = cy1',
+  '    print(f"1 {bx0} {by0} {bx1} {by1} {cx1} {cy1} {cx2} {cy2} {len(text_pts)}")',
+].join('\n');
+
 // 在实例内执行「文件传输助手链接法」使微信客户端访问一次公众号链接并刷新缓存中的会话 key：
 // 1) 严格用 --class "^wechat$" 区分主窗口与内置浏览器 WeChatAppEx（两者 WM_NAME 均为「微信」）；
 // 2) 严禁向微信主窗口发 Escape（Linux 微信主窗口收到 Escape 会弹出「退出登录？」确认框）；
-// 3) Ctrl+F 搜「文件传输助手」后识别下拉框唯一的 #07C160 微信绿图标点击进入（避免新号首项落到「搜一搜」）；
-// 4) 粘贴发送链接后向上扫描右侧 #9DF29F 绿色消息气泡并点击，轮询缓存 mtime 更新后发送 Ctrl+W 关标签并将微信主窗口置顶。
+// 3) Ctrl+F 搜「文件传输助手」后跳过左侧导航栏（x>=60）识别下拉框首个 #07C160 微信绿图标点击进入，未识别到则放弃发送（严禁盲点误触其它群聊）；
+// 4) 粘贴发送链接后提取最底部绿色气泡完整包围盒，精准点击第 1 行超链接文字，强校验 WeChatAppEx 窗口聚焦 + 核心缓存落盘后再发 Ctrl+W 关标签并将微信主窗口置顶。
 export async function refreshArticleViaFileHelper(
   inst: Instance,
   rawUrl: string,
   shouldAbort?: () => boolean,
-): Promise<{ ok: true; refreshed: boolean }> {
+): Promise<{ ok: true; refreshed: boolean; detail: RefreshArticleDetail }> {
   const validUrl = assertWechatMpUrl(rawUrl);
   const urlB64 = Buffer.from(validUrl, 'utf8').toString('base64');
   const helperNameB64 = Buffer.from('文件传输助手', 'utf8').toString('base64');
+  const cachePyB64 = Buffer.from(READ_WECHAT_CACHE_NS_PY, 'utf8').toString('base64');
+  const helperPyB64 = Buffer.from(SCAN_FILE_HELPER_ICON_PY, 'utf8').toString('base64');
+  const bubblePyB64 = Buffer.from(SCAN_LATEST_BUBBLE_LINK_PY, 'utf8').toString('base64');
 
   return withClipLock(inst.id, async () => {
     cancelClipRestore(inst.id);
     try {
-      // 第一阶段：检查登录态 + 记录刷新前缓存 mtime + 打开「文件传输助手」会话
+      // 第一阶段：检查登录态 + 置顶主窗口 + 搜索并确认进入「文件传输助手」会话
       const step1Cmd = [
         ...X_PRELUDE,
         CLIP_SAVE,
         FIND_WECHAT_MAIN_SH,
         'if [ -z "$WIN" ]; then echo "ERR_CODE=LOGIN_REQUIRED" >&2; exit 42; fi',
-        'BEFORE_NS=$(python3 -c \'import os,glob; ps=glob.glob("/config/.xwechat/radium/web/profiles/**/Favicons*",recursive=True)+glob.glob("/config/.xwechat/radium/web/profiles/**/Share Data*",recursive=True); print(max([os.stat(p).st_mtime_ns for p in ps if os.path.exists(p)] or [0]))\' 2>/dev/null || echo 0)',
+        `echo '${helperPyB64}' | base64 -d > ${CLIP_DIR}/scan_helper.py`,
         'xdotool windowactivate --sync "$WIN"',
-        'sleep 0.15',
+        'xdotool windowraise "$WIN" 2>/dev/null || true',
+        'sleep 0.18',
         xdoKey('ctrl+f'),
-        'sleep 0.2',
+        'sleep 0.22',
         xdoKey('ctrl+a'),
         xdoKey('BackSpace'),
         `echo '${helperNameB64}' | base64 -d > ${CLIP_DIR}/typed.txt`,
         `xclip -selection clipboard -i ${CLIP_DIR}/typed.txt >/dev/null 2>&1`,
         'sleep 0.08',
         xdoKey('ctrl+v'),
-        'sleep 0.8',
-        'POS=$(ffmpeg -loglevel error -f x11grab -video_size "${WW}x${WH}" -i "${DISPLAY}+${WX},${WY}" -frames:v 1 -f image2pipe -vcodec ppm - | python3 -c \'',
-        'import sys',
-        'data = sys.stdin.buffer.read()',
-        'idx = 0',
-        'toks = []',
-        'while len(toks) < 4 and idx < len(data):',
-        '    while idx < len(data) and data[idx] in b" \\t\\r\\n": idx += 1',
-        '    if idx < len(data) and data[idx] == 35:',
-        '        while idx < len(data) and data[idx] != 10: idx += 1',
-        '        continue',
-        '    s = idx',
-        '    while idx < len(data) and data[idx] not in b" \\t\\r\\n": idx += 1',
-        '    if idx > s: toks.append(data[s:idx])',
-        'w, h = int(toks[1]), int(toks[2])',
-        'pix = memoryview(data)[idx + 1:]',
-        'xs, ys = [], []',
-        'xmax = min(220, w // 2)',
-        'ymax = min(h - 60, 680)',
-        'for y in range(65, ymax, 2):',
-        '    row = y * w * 3',
-        '    for x in range(25, xmax, 2):',
-        '        p = row + x * 3',
-        '        r, g, b = pix[p], pix[p+1], pix[p+2]',
-        '        if r < 55 and g > 165 and 60 <= b <= 135:',
-        '            xs.append(x); ys.append(y)',
-        'if len(xs) >= 8:',
-        '    xs.sort(); ys.sort()',
-        '    print(f"{xs[len(xs)//2] + 65} {ys[len(ys)//2]}")',
-        'else:',
-        '    print("135 125")',
-        '\')',
-        'CX=$(echo "$POS" | awk \'{print $1}\')',
-        'CY=$(echo "$POS" | awk \'{print $2}\')',
-        'xdotool mousemove --sync $((WX + CX)) $((WY + CY)) click 1',
-        'sleep 0.5',
-        'echo "BEFORE_NS=$BEFORE_NS"',
+        'HFOUND=0; HX=0; HY=0',
+        'for try_i in 1 2; do',
+        '  if [ "$try_i" -eq 1 ]; then sleep 0.8; else sleep 0.7; fi',
+        `  HPOS=$(ffmpeg -loglevel error -f x11grab -video_size "\${WW}x\${WH}" -i "\${DISPLAY}+\${WX},\${WY}" -frames:v 1 -f image2pipe -vcodec ppm - | python3 ${CLIP_DIR}/scan_helper.py 2>/dev/null || echo "0 0 0")`,
+        '  set -- $HPOS',
+        '  HFOUND="${1:-0}"; HX="${2:-0}"; HY="${3:-0}"',
+        '  if [ "$HFOUND" = "1" ]; then break; fi',
+        'done',
+        'if [ "$HFOUND" = "1" ]; then',
+        '  xdotool mousemove --sync $((WX + HX)) $((WY + HY)) click 1',
+        '  sleep 0.45',
+        'else',
+        '  xdotool mousemove --sync $((WX + 360)) $((WY + 28)) click 1 2>/dev/null || true',
+        'fi',
+        'echo "HELPER_FOUND=$HFOUND HELPER_POS=${HX},${HY}"',
       ].join('\n');
 
       let step1Out = '';
@@ -2679,6 +2802,21 @@ export async function refreshArticleViaFileHelper(
         throw e;
       }
 
+      const helperFound = /HELPER_FOUND=1/.test(step1Out);
+      const helperPos = step1Out.match(/HELPER_POS=([0-9,]+)/)?.[1];
+      if (!helperFound) {
+        return {
+          ok: true,
+          refreshed: false,
+          detail: {
+            helperPos,
+            appexOpened: false,
+            cacheUpdated: false,
+            reason: '未在微信搜索结果中识别到「文件传输助手」图标，已中止发送以免误触其它会话',
+          },
+        };
+      }
+
       if (shouldAbort?.()) {
         const err: any = new Error('检测到用户正在远程操作桌面，已中止自动刷新');
         err.statusCode = 409;
@@ -2686,13 +2824,14 @@ export async function refreshArticleViaFileHelper(
         throw err;
       }
 
-      const beforeNs = (step1Out.match(/BEFORE_NS=(\d+)/)?.[1]) || '0';
-
-      // 第二阶段：粘贴发送文章/主页链接 → 点击底部绿色消息气泡打开内置浏览器 → 等待缓存落盘并关闭浏览器窗口
+      // 第二阶段：粘贴发送链接 → 点击前采样缓存基准 → 点击最新气泡第 1 行超链接文字（支持重试）→ 强校验 WeChatAppEx 打开与缓存落盘 → Ctrl+W 收尾
       const step2Cmd = [
         ...X_PRELUDE,
         FIND_WECHAT_MAIN_SH,
         'if [ -z "$WIN" ]; then echo "ERR_CODE=LOGIN_REQUIRED" >&2; exit 42; fi',
+        `mkdir -p ${CLIP_DIR}`,
+        `echo '${cachePyB64}' | base64 -d > ${CLIP_DIR}/cache_ns.py`,
+        `echo '${bubblePyB64}' | base64 -d > ${CLIP_DIR}/scan_bubble.py`,
         'xdotool windowactivate --sync "$WIN"',
         'IN_X=$((WW - 300)); if [ "$IN_X" -lt 480 ]; then IN_X=480; fi',
         'IN_Y=$((WH - 85))',
@@ -2706,66 +2845,97 @@ export async function refreshArticleViaFileHelper(
         xdoKey('ctrl+v'),
         'sleep 0.25',
         xdoKey('Return'),
-        'sleep 0.9',
-        'BPOS=$(ffmpeg -loglevel error -f x11grab -video_size "${WW}x${WH}" -i "${DISPLAY}+${WX},${WY}" -frames:v 1 -f image2pipe -vcodec ppm - | python3 -c \'',
-        'import sys',
-        'data = sys.stdin.buffer.read()',
-        'idx = 0; toks = []',
-        'while len(toks) < 4 and idx < len(data):',
-        '    while idx < len(data) and data[idx] in b" \\t\\r\\n": idx += 1',
-        '    if idx < len(data) and data[idx] == 35:',
-        '        while idx < len(data) and data[idx] != 10: idx += 1',
-        '        continue',
-        '    s = idx',
-        '    while idx < len(data) and data[idx] not in b" \\t\\r\\n": idx += 1',
-        '    if idx > s: toks.append(data[s:idx])',
-        'w, h = int(toks[1]), int(toks[2])',
-        'pix = memoryview(data)[idx + 1:]',
-        'xmin = min(380, w // 2)',
-        'xmax = max(xmin + 40, w - 55)',
-        'found = None',
-        'for y in range(h - 150, 75, -2):',
-        '    row = y * w * 3',
-        '    gx = []',
-        '    for x in range(xmin, xmax, 2):',
-        '        p = row + x * 3',
-        '        r, g, b = pix[p], pix[p+1], pix[p+2]',
-        '        if 125 <= r <= 195 and 210 <= g <= 255 and 80 <= b <= 195 and g > r + 40 and g > b + 35:',
-        '            gx.append(x)',
-        '    if len(gx) >= 12:',
-        '        found = (gx[len(gx)//2], max(80, y - 14))',
-        '        break',
-        'if found:',
-        '    print(f"{found[0]} {found[1]}")',
-        'else:',
-        '    print(f"{max(500, w - 260)} {max(120, h - 220)}")',
-        '\')',
-        'BX=$(echo "$BPOS" | awk \'{print $1}\')',
-        'BY=$(echo "$BPOS" | awk \'{print $2}\')',
-        'xdotool mousemove --sync $((WX + BX)) $((WY + BY)) click 1',
-        'REFRESHED=0',
-        'i=0',
-        'while [ "$i" -lt 14 ]; do',
-        '  sleep 0.5',
-        '  NOW_NS=$(python3 -c \'import os,glob; ps=glob.glob("/config/.xwechat/radium/web/profiles/**/Favicons*",recursive=True)+glob.glob("/config/.xwechat/radium/web/profiles/**/Share Data*",recursive=True); print(max([os.stat(p).st_mtime_ns for p in ps if os.path.exists(p)] or [0]))\' 2>/dev/null || echo 0)',
-        `  if [ "$NOW_NS" -gt "${beforeNs}" ] 2>/dev/null; then REFRESHED=1; sleep 0.8; break; fi`,
-        '  i=$((i + 1))',
-        'done',
+        'sleep 0.95',
+        `BEFORE_NS=$(python3 ${CLIP_DIR}/cache_ns.py 2>/dev/null || echo 0)`,
+        `BPOS=$(ffmpeg -loglevel error -f x11grab -video_size "\${WW}x\${WH}" -i "\${DISPLAY}+\${WX},\${WY}" -frames:v 1 -f image2pipe -vcodec ppm - | python3 ${CLIP_DIR}/scan_bubble.py 2>/dev/null || echo "0 0 0 0 0 0 0 0 0 0")`,
+        'set -- $BPOS',
+        'BFOUND="${1:-0}"; BX0="${2:-0}"; BY0="${3:-0}"; BX1="${4:-0}"; BY1="${5:-0}"',
+        'CX1="${6:-0}"; CY1="${7:-0}"; CX2="${8:-0}"; CY2="${9:-0}"',
+        'APPEX_OPENED=0; CACHE_UPDATED=0; REFRESHED=0; ATTEMPTS=0; LAST_CLICK="0,0"',
+        'if [ "$BFOUND" = "1" ]; then',
+        '  for try_click in 1 2; do',
+        '    ATTEMPTS="$try_click"',
+        '    if [ "$try_click" -eq 1 ]; then TX="$CX1"; TY="$CY1"; else',
+        '      xdotool windowactivate --sync "$WIN" 2>/dev/null || true',
+        '      sleep 0.12',
+        '      TX="$CX2"; TY="$CY2"',
+        '    fi',
+        '    LAST_CLICK="${TX},${TY}"',
+        '    xdotool mousemove --sync $((WX + TX)) $((WY + TY))',
+        '    sleep 0.08',
+        '    xdotool click 1',
+        '    w_i=0',
+        '    while [ "$w_i" -lt 6 ]; do',
+        '      sleep 0.4',
+        '      FOCUS_WIN=$(xdotool getwindowfocus 2>/dev/null || true)',
+        '      if [ -n "$FOCUS_WIN" ] && [ "$FOCUS_WIN" != "$WIN" ] && xdotool search --onlyvisible --class "WeChatAppEx" 2>/dev/null | grep -qx "$FOCUS_WIN"; then',
+        '        APPEX_OPENED=1; break',
+        '      fi',
+        '      w_i=$((w_i + 1))',
+        '    done',
+        '    if [ "$APPEX_OPENED" = "1" ]; then break; fi',
+        '  done',
+        'fi',
+        'if [ "$APPEX_OPENED" = "1" ]; then',
+        '  c_i=0',
+        '  while [ "$c_i" -lt 16 ]; do',
+        '    sleep 0.5',
+        `    NOW_NS=$(python3 ${CLIP_DIR}/cache_ns.py 2>/dev/null || echo 0)`,
+        '    if [ "$NOW_NS" -gt "$BEFORE_NS" ] 2>/dev/null; then',
+        '      CACHE_UPDATED=1',
+        '      if [ "$c_i" -lt 3 ]; then sleep 1.8; else sleep 1.2; fi',
+        '      REFRESHED=1',
+        '      break',
+        '    fi',
+        '    c_i=$((c_i + 1))',
+        '  done',
+        'fi',
         // 严禁调用 pkill 或 xdotool windowclose（libxdo 的 windowclose 底层调用 XDestroyWindow 强拆顶层及子窗口，
         // 会触发 WeChatAppEx X11 BadWindow 致命错误崩溃，导致微信主进程与内置浏览器的常驻 IPC 通道断裂）：
         // 仅在当前聚焦窗口为 WeChatAppEx 时发送一次 Ctrl+W 让浏览器内部正常关闭标签页，再将微信主窗口置顶回前台。
         'FOCUS_WIN=$(xdotool getwindowfocus 2>/dev/null || true)',
         'if [ -n "$FOCUS_WIN" ] && [ "$FOCUS_WIN" != "$WIN" ] && xdotool search --onlyvisible --class "WeChatAppEx" 2>/dev/null | grep -qx "$FOCUS_WIN"; then',
         `  ${xdoKey('ctrl+w')} 2>/dev/null || true`,
-        '  sleep 0.15',
+        '  sleep 0.2',
         'fi',
         'xdotool windowactivate --sync "$WIN" 2>/dev/null || true',
-        'echo "REFRESHED=$REFRESHED"',
+        `rm -f ${CLIP_DIR}/scan_helper.py ${CLIP_DIR}/cache_ns.py ${CLIP_DIR}/scan_bubble.py 2>/dev/null || true`,
+        'echo "BUBBLE_FOUND=$BFOUND BBOX=${BX0},${BY0},${BX1},${BY1} CLICK=$LAST_CLICK ATTEMPTS=$ATTEMPTS APPEX_OPENED=$APPEX_OPENED CACHE_UPDATED=$CACHE_UPDATED REFRESHED=$REFRESHED"',
       ].join('\n');
 
       const step2Out = await execCapture(inst, ['sh', '-c', step2Cmd]);
+      const bubbleFound = /BUBBLE_FOUND=1/.test(step2Out);
+      const appexOpened = /APPEX_OPENED=1/.test(step2Out);
+      const cacheUpdated = /CACHE_UPDATED=1/.test(step2Out);
       const refreshed = /REFRESHED=1/.test(step2Out);
-      return { ok: true, refreshed };
+      const bubbleBbox = step2Out.match(/BBOX=([0-9,]+)/)?.[1];
+      const clickPos = step2Out.match(/CLICK=([0-9,]+)/)?.[1];
+      const attempts = Number(step2Out.match(/ATTEMPTS=(\d+)/)?.[1] || '0');
+
+      let reason: string | undefined;
+      if (!refreshed) {
+        if (!bubbleFound) {
+          reason = '发送链接后未在聊天区域底部检测到绿色消息气泡';
+        } else if (!appexOpened) {
+          reason = '已点击消息气泡中的链接位置，但微信内置浏览器（WeChatAppEx）未弹出（请确认实例已开启 seccomp=unconfined 或桌面未被弹窗遮挡）';
+        } else if (!cacheUpdated) {
+          reason = '内置浏览器已弹出，但等待超时未检测到新的会话缓存落盘（页面可能加载缓慢或受网络限制）';
+        }
+      }
+
+      return {
+        ok: true,
+        refreshed,
+        detail: {
+          helperPos,
+          bubbleBbox,
+          clickPos,
+          attempts,
+          appexOpened,
+          cacheUpdated,
+          ...(reason ? { reason } : {}),
+        },
+      };
     } finally {
       await restoreClipboard(inst);
     }

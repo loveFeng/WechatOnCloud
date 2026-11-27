@@ -2168,8 +2168,21 @@ app.post('/api/addon/v1/instances/:id/actions/refresh-article', async (req, repl
   try {
     appendInstanceLog(id, `[addon] 触发文件传输助手自动刷新密钥`);
     const res = await refreshArticleViaFileHelper(inst, validUrl, () => !!activeHumanHolder(id));
-    appendInstanceLog(id, `[addon] 自动刷新完成（refreshed=${res.refreshed}）`);
-    return { ok: true, refreshed: res.refreshed };
+    const d = res.detail || {};
+    appendInstanceLog(
+      id,
+      `[addon] 自动刷新完成（refreshed=${res.refreshed}, appex=${!!d.appexOpened}, cache=${!!d.cacheUpdated}, attempts=${d.attempts ?? 0}, click=${d.clickPos || "-"}${d.reason ? ", reason=" + d.reason : ""}）`,
+    );
+    if (!res.refreshed) {
+      return reply.code(502).send({
+        ok: false,
+        refreshed: false,
+        code: "REFRESH_NOT_CONFIRMED",
+        error: d.reason || "已发送链接但未能确认内置浏览器打开文章并写入新会话缓存",
+        detail: d,
+      });
+    }
+    return { ok: true, refreshed: true, detail: d };
   } catch (e: any) {
     const code = typeof e?.code === 'string' ? e.code : undefined;
     const status = Number(e?.statusCode) || (code ? 409 : 500);
